@@ -44,63 +44,6 @@ DARK_THEME = {
 }
 
 class OllamaTranslatorApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Ollama Translator (Python)")
-        # self.root.geometry("800x600") # Optional: Set initial size
-
-        # Initialize tkinter variables early to avoid attribute errors
-        self.api_endpoint_var = tk.StringVar(value=DEFAULT_OLLAMA_API_BASE_URL)
-        self.direction_var = tk.StringVar(value="de-en")
-
-        self.active_model = None
-        self.translation_controller = None  # To hold the AbortController equivalent
-
-        # --- Theme Setup ---
-        self.style = Style(root)
-        self.current_theme = "light"  # Start with light theme
-
-        # --- Main Frames ---
-        self.header_frame = ttk.Frame(root, padding="10")
-        self.header_frame.grid(row=0, column=0, sticky="ew")
-
-        self.model_mgmt_frame = ttk.LabelFrame(root, text="Model Management", padding="10")
-        self.model_mgmt_frame.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
-
-        self.translation_frame = ttk.LabelFrame(root, text="Translation", padding="10")
-        self.translation_frame.grid(row=2, column=0, padx=10, pady=5, sticky="nsew")
-
-        self.progress_frame = ttk.Frame(root, padding="10")
-        self.progress_frame.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
-
-        self.footer_frame = ttk.Frame(root, padding="10")
-        self.footer_frame.grid(row=4, column=0, sticky="ew")
-
-        # Configure grid weights
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(2, weight=1) # Allow translation frame to expand vertically
-        self.translation_frame.columnconfigure(0, weight=1)
-        self.translation_frame.columnconfigure(1, weight=1)
-        self.translation_frame.rowconfigure(1, weight=1) # Allow text areas to expand
-
-        self.create_header_widgets()
-        self.create_model_management_widgets()
-        self.create_translation_widgets()
-        self.create_progress_widgets()
-        self.create_footer_widgets()
-
-        # Load config before applying theme
-        self._load_config()
-
-        self.apply_theme()
-
-        # Setup keyboard shortcuts
-        self._setup_keyboard_shortcuts()
-
-        # Initial actions
-        self.start_ollama_server()
-        self.refresh_available_models()
-
     # --- Theme Management ---
     def apply_theme(self):
         """Apply the current theme to the entire application."""
@@ -228,43 +171,6 @@ class OllamaTranslatorApp:
         except Exception as e:
             print(f"Failed to save config: {e}")
 
-    # --- Improved start_ollama_server with readiness check ---
-    def start_ollama_server(self):
-        import time
-        try:
-            # Try to connect to the server first to see if it's already running
-            requests.get(self.get_api_base_url(), timeout=1)  # Short timeout
-            print("Ollama server already running.")
-        except requests.exceptions.RequestException:
-            print("Ollama server not running. Attempting to start...")
-            try:
-                if os.name == 'nt':  # Windows
-                    subprocess.Popen(["ollama", "serve"], creationflags=subprocess.CREATE_NO_WINDOW)
-                else:  # macOS/Linux
-                    subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                print("Ollama serve command issued.")
-                # Wait for server readiness with retries
-                max_retries = 10
-                retry_delay = 1  # seconds
-                for i in range(max_retries):
-                    try:
-                        time.sleep(retry_delay)
-                        response = requests.get(self.get_api_base_url(), timeout=1)
-                        if response.status_code == 200:
-                            print("Ollama server is ready.")
-                            break
-                    except requests.exceptions.RequestException:
-                        print(f"Waiting for Ollama server to start... ({i+1}/{max_retries})")
-                else:
-                    self.show_error("Failed to start Ollama server after multiple attempts.")
-                    messagebox.showerror("Ollama Error", "Failed to start Ollama server after multiple attempts.")
-            except FileNotFoundError:
-                self.show_error("Ollama command not found. Ensure Ollama is installed and in your PATH.")
-                messagebox.showerror("Ollama Error", "Ollama command not found. Please ensure Ollama is installed and in your system's PATH.")
-            except Exception as e:
-                self.show_error(f"Failed to start Ollama server: {e}")
-                messagebox.showerror("Ollama Error", f"Failed to start Ollama server: {e}")
-
     # --- Override __init__ to add config load and keyboard shortcuts setup ---
     def __init__(self, root):
         self.root = root
@@ -328,14 +234,6 @@ class OllamaTranslatorApp:
         self._save_config()
         self.root.destroy()
 
-    # --- Thread-safe GUI update example for translation cancellation ---
-    def cancel_translation(self):
-        """Request cancellation of the ongoing translation."""
-        if self.translation_controller:
-            self.translation_controller['abort'] = True
-            print("Cancellation requested.")
-            self.cancel_button.config(state=tk.DISABLED)
-
     def _apply_theme_to_widgets(self, theme):
         """Apply theme styles to widgets, used during theme toggle or updates."""
         self._configure_ttk_styles(theme)
@@ -343,44 +241,6 @@ class OllamaTranslatorApp:
 
     def toggle_theme(self):
         """Toggle between light and dark themes."""
-        self.current_theme = "dark" if self.current_theme == "light" else "light"
-        self.apply_theme()
-
-    # Other methods remain unchanged but with added or improved docstrings
-
-
-        self.style.configure('TLabel', background=theme["bg"], foreground=theme["fg"])
-        self.style.configure('TFrame', background=theme["bg"])
-        self.style.configure('TLabelframe', background=theme["bg"], foreground=theme["fg"])
-        self.style.configure('TLabelframe.Label', background=theme["bg"], foreground=theme["fg"])
-        self.style.configure('TCombobox', fieldbackground=theme["entry_bg"], foreground=theme["entry_fg"],
-                             selectbackground=theme["select_bg"], selectforeground=theme["select_fg"])
-        self.style.map('TCombobox', fieldbackground=[('readonly', theme["entry_bg"])],
-                                  selectbackground=[('readonly', theme["select_bg"])],
-                                  selectforeground=[('readonly', theme["select_fg"])])
-        # Removed attempt to style TCombobox.downarrow as it was unreliable
-        self.style.configure('TProgressbar', background=theme["button_bg"], troughcolor=theme["entry_bg"]) 
-
-        # Configure non-ttk widgets (Text, Listbox)
-        # Note: tk.Text does not support 'disabledbackground'
-        text_config = {"background": theme["entry_bg"], "foreground": theme["entry_fg"],
-                       "insertbackground": theme["fg"], "selectbackground": theme["select_bg"],
-                       "selectforeground": theme["select_fg"]}
-        listbox_config = {"background": theme["entry_bg"], "foreground": theme["entry_fg"],
-                          "selectbackground": theme["select_bg"], "selectforeground": theme["select_fg"]}
-
-        # Apply to existing widgets if they exist
-        if hasattr(self, 'input_text'): self.input_text.config(**text_config)
-        if hasattr(self, 'output_text'): self.output_text.config(**text_config)
-        if hasattr(self, 'available_models_listbox'): self.available_models_listbox.config(**listbox_config)
-
-        # Apply specific foreground colors
-        if hasattr(self, 'error_label'): self.error_label.config(foreground=theme["error_fg"])
-        if hasattr(self, 'active_model_label'):
-            active_fg = theme["active_model_fg"] if self.active_model else theme["inactive_model_fg"]
-            self.active_model_label.config(foreground=active_fg)
-
-    def toggle_theme(self):
         self.current_theme = "dark" if self.current_theme == "light" else "light"
         self.apply_theme()
 
@@ -614,13 +474,11 @@ class OllamaTranslatorApp:
     def start_translation(self):
         if not self.active_model:
             messagebox.showerror("Error", "No model selected for translation.")
-            messagebox.showerror("Error", "No model selected for translation.")  # Ensure error dialog shown
             return
 
         input_content = self.input_text.get("1.0", "end-1c").strip()
         if not input_content:
             messagebox.showerror("Error", "Input text cannot be empty.")
-            messagebox.showerror("Error", "Input text cannot be empty.")  # Ensure error dialog shown
             return
 
         self.clear_error()

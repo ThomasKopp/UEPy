@@ -1,80 +1,52 @@
-# Ollama Translator GUI
+# Ollama Translator GUI (Tkinter)
 
-A user-friendly desktop application for translating text using Ollama's local language models. This application provides a simple graphical interface to interact with Ollama's API for translation tasks.
+Grafische Übersetzungsoberfläche für lokale Ollama-Modelle. Die App sucht bei Bedarf den Ollama‑Daemon, holt verfügbare Modelle ab, streamt Übersetzungen und bietet Dark/Light‑Theme, Datei‑I/O sowie Tastenkürzel.
 
-## Features
+## Funktionen
+- Modellverwaltung: Liste laden, Modell aktivieren/deaktivieren.
+- Übersetzung DE↔EN per Streaming; Abbrechen möglich.
+- Datei‑Import/Export (`.txt`), Kopieren in die Zwischenablage.
+- Themes umschalten, Einstellungen (API‑Endpoint, Richtung, letztes Modell, Theme) werden im Home-Verzeichnis gespeichert.
+- Tastenkürzel: `Ctrl+Enter` Übersetzen, `Esc` Abbrechen, `Ctrl+L` Eingabe löschen, `Ctrl+T` Theme, `Ctrl+R` Modelle neu laden.
 
-- **Local Translation**: Utilizes Ollama's local language models for private, offline-capable translations
-- **Dark/Light Theme**: Toggle between light and dark themes for comfortable usage in any environment
-- **Model Management**: Easily switch between different Ollama models
-- **File Support**: Translate text directly from files
-- **Clipboard Integration**: Copy translations to clipboard with a single click
-- **Responsive UI**: Clean and intuitive interface built with Tkinter
+## Voraussetzungen
+- Python ≥3.10 (Tkinter muss installiert sein; unter Windows üblicherweise enthalten).
+- Ollama installiert und in `PATH` (`ollama serve` muss starten können).
+- Abhängigkeiten: `requests` (GUI nutzt außerdem Standardbibliothek/Tkinter).  
+  Installation: `pip install -r requirements.txt`
 
-## Prerequisites
+## Start
+```bash
+python ollama_translator_gui.py
+```
+Die App versucht automatisch `ollama serve` zu starten. Läuft Ollama nicht oder ist nicht im `PATH`, erscheint eine Fehlermeldung.
 
-- Python 3.6 or higher
-- Ollama installed and running locally (default: http://localhost:11434)
-- Required Python packages (install via `pip install -r requirements.txt`)
+## Nutzung
+1) Endpoint und Übersetzungsrichtung wählen (Standard: `http://localhost:11434/api`, DE→EN).  
+2) „Refresh“ lädt Modelle, „Activate Model“ setzt das aktive Modell.  
+3) Text eingeben oder `Upload TXT`.  
+4) „Translate“ oder `Ctrl+Enter` starten; Ausgabe erscheint gestreamt.  
+5) Mit „Cancel“ bzw. `Esc` abbrechen, „Save TXT“ speichern, „Copy“ kopieren.  
+6) Theme via Button oder `Ctrl+T` wechseln.
 
-## Installation
+## Tests
+Unittests:  
+```bash
+python -m unittest test_critical_path_ollama_translator.py
+```  
+Hinweis: Die Tests erzeugen Tkinter-Fenster und mocken Netzwerk/Messageboxen; sie benötigen eine funktionierende Python/Tkinter-Installation.
 
-1. Clone this repository or download the source code
-2. Install the required dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
-3. Ensure Ollama is running on your system
+## Build (optional)
+Ein Windows-Executable kann mit PyInstaller erstellt werden:  
+```bash
+pyinstaller --onefile --windowed ollama_translator_gui.py
+```  
+Ergebnis liegt im Verzeichnis `dist/`.
 
-## Usage
+## Bekannte Stolpersteine
+- Kein Python/Tkinter im System-PATH → Programm/Tests starten nicht.  
+- Ollama nicht installiert oder nicht im `PATH` → Start des Daemons schlägt fehl.  
+- Models leer → API-Endpunkt prüfen (`/api/tags` muss erreichbar sein).
 
-1. Run the application:
-   ```
-   python ollama_translator_gui.py
-   ```
-2. Select your preferred Ollama model from the dropdown
-3. Enter the text you want to translate in the input area
-4. Click the "Translate" button
-5. View the translation in the output area
-
-### File Translation
-
-1. Click the "Open File" button
-2. Select a text file to translate
-3. The content will be loaded into the input area
-4. Click "Translate" to process the content
-
-## Building the Application
-
-To create a standalone executable:
-
-1. Install PyInstaller:
-   ```
-   pip install pyinstaller
-   ```
-2. Build the executable:
-   ```
-   pyinstaller --onefile --windowed ollama_translator_gui.py
-   ```
-3. The executable will be in the `dist` directory
-
-## Requirements
-
-- requests
-- tkinter (usually comes with Python)
-
-## License
-
-This project is open source and available under the [MIT License](LICENSE).
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-## Support
-
-For support, please open an issue in the repository or contact the maintainers.
-
----
-
-*Note: This application requires Ollama to be installed and running locally. For more information about Ollama, visit [ollama.ai](https://ollama.ai/).*
+## Lizenz
+Im Repository liegt keine Lizenzdatei; vor Weitergabe/Nutzung bitte klären.
