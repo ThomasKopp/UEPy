@@ -1,16 +1,16 @@
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-import requests
-import threading
-import json
-import subprocess
 import os
-
-# Import Style
+import time
+import json
+import threading
+import subprocess
+import tkinter as tk
+from tkinter import filedialog, messagebox
+from tkinter import ttk
 from tkinter.ttk import Style
+import requests
 
 # Default Ollama API endpoint
-OLLAMA_API_BASE_URL = "http://localhost:11434/api"
+DEFAULT_OLLAMA_API_BASE_URL = "http://localhost:11434/api"
 
 # --- Theme Definitions ---
 LIGHT_THEME = {
@@ -49,13 +49,16 @@ class OllamaTranslatorApp:
         self.root.title("Ollama Translator (Python)")
         # self.root.geometry("800x600") # Optional: Set initial size
 
+        # Initialize tkinter variables early to avoid attribute errors
+        self.api_endpoint_var = tk.StringVar(value=DEFAULT_OLLAMA_API_BASE_URL)
+        self.direction_var = tk.StringVar(value="de-en")
+
         self.active_model = None
-        self.translation_controller = None # To hold the AbortController equivalent
+        self.translation_controller = None  # To hold the AbortController equivalent
 
         # --- Theme Setup ---
         self.style = Style(root)
-        self.current_theme = "light" # Start with light theme
-        self.apply_theme()
+        self.current_theme = "light"  # Start with light theme
 
         # --- Main Frames ---
         self.header_frame = ttk.Frame(root, padding="10")
@@ -86,19 +89,34 @@ class OllamaTranslatorApp:
         self.create_progress_widgets()
         self.create_footer_widgets()
 
+        # Load config before applying theme
+        self._load_config()
+
+        self.apply_theme()
+
+        # Setup keyboard shortcuts
+        self._setup_keyboard_shortcuts()
+
         # Initial actions
         self.start_ollama_server()
         self.refresh_available_models()
 
     # --- Theme Management ---
     def apply_theme(self):
+        """Apply the current theme to the entire application."""
         theme = LIGHT_THEME if self.current_theme == "light" else DARK_THEME
 
-        # Configure root window background
+        self._configure_root(theme)
+        self._configure_ttk_styles(theme)
+        self._configure_non_ttk_widgets(theme)
+
+    def _configure_root(self, theme):
+        """Configure the root window background color."""
         self.root.config(bg=theme["bg"])
 
-        # Configure ttk styles
-        self.style.theme_use('clam') # Use a theme that allows more customization
+    def _configure_ttk_styles(self, theme):
+        """Configure ttk widget styles based on the theme."""
+        self.style.theme_use('clam')  # Use a theme that allows more customization
 
         self.style.configure('.', background=theme["bg"], foreground=theme["fg"],
                              fieldbackground=theme["entry_bg"], selectbackground=theme["select_bg"],
@@ -108,6 +126,228 @@ class OllamaTranslatorApp:
         self.style.configure('TButton', background=theme["button_bg"], foreground=theme["button_fg"])
         self.style.map('TButton', background=[('active', theme["select_bg"]), ('disabled', theme["bg"])],
                                   foreground=[('disabled', theme["disabled_fg"])])
+
+        self.style.configure('TLabel', background=theme["bg"], foreground=theme["fg"])
+        self.style.configure('TFrame', background=theme["bg"])
+        self.style.configure('TLabelframe', background=theme["bg"], foreground=theme["fg"])
+        self.style.configure('TLabelframe.Label', background=theme["bg"], foreground=theme["fg"])
+        self.style.configure('TCombobox', fieldbackground=theme["entry_bg"], foreground=theme["entry_fg"],
+                             selectbackground=theme["select_bg"], selectforeground=theme["select_fg"])
+        self.style.map('TCombobox', fieldbackground=[('readonly', theme["entry_bg"])],
+                                  selectbackground=[('readonly', theme["select_bg"])],
+                                  selectforeground=[('readonly', theme["select_fg"])])
+        # Removed attempt to style TCombobox.downarrow as it was unreliable
+        self.style.configure('TProgressbar', background=theme["button_bg"], troughcolor=theme["entry_bg"])
+
+    def _configure_non_ttk_widgets(self, theme):
+        """Configure non-ttk widgets like Text, Listbox, and Labels."""
+        text_config = {"background": theme["entry_bg"], "foreground": theme["entry_fg"],
+                       "insertbackground": theme["fg"], "selectbackground": theme["select_bg"],
+                       "selectforeground": theme["select_fg"]}
+        listbox_config = {"background": theme["entry_bg"], "foreground": theme["entry_fg"],
+                          "selectbackground": theme["select_bg"], "selectforeground": theme["select_fg"]}
+
+        if hasattr(self, 'input_text'):
+            self.input_text.config(**text_config)
+        if hasattr(self, 'output_text'):
+            self.output_text.config(**text_config)
+        if hasattr(self, 'available_models_listbox'):
+            self.available_models_listbox.config(**listbox_config)
+        if hasattr(self, 'error_label'):
+            self.error_label.config(foreground=theme["error_fg"])
+        if hasattr(self, 'active_model_label'):
+            active_fg = theme["active_model_fg"] if self.active_model else theme["inactive_model_fg"]
+            self.active_model_label.config(foreground=active_fg)
+
+
+    # --- Keyboard Shortcuts ---
+    def _setup_keyboard_shortcuts(self):
+        """Bind keyboard shortcuts to their respective handlers."""
+        self.root.bind_all("<Control-Return>", lambda e: self._keyboard_translate())
+        self.root.bind_all("<Escape>", lambda e: self._keyboard_cancel())
+        self.root.bind_all("<Control-l>", lambda e: self._keyboard_clear_input())
+        self.root.bind_all("<Control-t>", lambda e: self._keyboard_toggle_theme())
+        self.root.bind_all("<Control-r>", lambda e: self._keyboard_refresh_models())
+
+    def _keyboard_translate(self):
+        """Handle Ctrl+Enter to start translation."""
+        if self.translate_button['state'] == tk.NORMAL:
+            self.start_translation()
+            self.translate_button.config(state=tk.DISABLED)  # Ensure button is disabled after starting translation
+
+    def _keyboard_cancel(self):
+        """Handle Escape to cancel translation."""
+        if self.cancel_button['state'] == tk.NORMAL:
+            self.cancel_translation()
+
+    def _keyboard_clear_input(self):
+        """Handle Ctrl+L to clear input text."""
+        self.input_text.delete('1.0', tk.END)
+        self.update_translate_button_state()
+
+    def _keyboard_toggle_theme(self):
+        """Handle Ctrl+T to toggle theme."""
+        self.toggle_theme()
+
+    def _keyboard_refresh_models(self):
+        """Handle Ctrl+R to refresh available models."""
+        self.refresh_available_models()
+
+    # --- Configuration Persistence ---
+    def _load_config(self):
+        """Load user configuration from a JSON file."""
+        config_path = os.path.join(os.path.expanduser("~"), ".ollama_translator_config.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                self.current_theme = config.get("theme", "light")
+                self.api_endpoint_var.set(config.get("api_endpoint", DEFAULT_OLLAMA_API_BASE_URL))
+                self.direction_var.set(config.get("direction", "de-en"))
+                last_model = config.get("last_model", None)
+                if last_model:
+                    self.active_model = last_model
+                    active_fg = LIGHT_THEME["active_model_fg"] if self.current_theme == "light" else DARK_THEME["active_model_fg"]
+                    self.active_model_label.config(text=self.active_model, foreground=active_fg)
+                self.apply_theme()
+            except Exception as e:
+                print(f"Failed to load config: {e}")
+
+    def _save_config(self):
+        """Save user configuration to a JSON file."""
+        config_path = os.path.join(os.path.expanduser("~"), ".ollama_translator_config.json")
+        config = {
+            "theme": self.current_theme,
+            "api_endpoint": self.api_endpoint_var.get(),
+            "direction": self.direction_var.get(),
+            "last_model": self.active_model
+        }
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=4)
+        except Exception as e:
+            print(f"Failed to save config: {e}")
+
+    # --- Improved start_ollama_server with readiness check ---
+    def start_ollama_server(self):
+        import time
+        try:
+            # Try to connect to the server first to see if it's already running
+            requests.get(self.get_api_base_url(), timeout=1)  # Short timeout
+            print("Ollama server already running.")
+        except requests.exceptions.RequestException:
+            print("Ollama server not running. Attempting to start...")
+            try:
+                if os.name == 'nt':  # Windows
+                    subprocess.Popen(["ollama", "serve"], creationflags=subprocess.CREATE_NO_WINDOW)
+                else:  # macOS/Linux
+                    subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                print("Ollama serve command issued.")
+                # Wait for server readiness with retries
+                max_retries = 10
+                retry_delay = 1  # seconds
+                for i in range(max_retries):
+                    try:
+                        time.sleep(retry_delay)
+                        response = requests.get(self.get_api_base_url(), timeout=1)
+                        if response.status_code == 200:
+                            print("Ollama server is ready.")
+                            break
+                    except requests.exceptions.RequestException:
+                        print(f"Waiting for Ollama server to start... ({i+1}/{max_retries})")
+                else:
+                    self.show_error("Failed to start Ollama server after multiple attempts.")
+                    messagebox.showerror("Ollama Error", "Failed to start Ollama server after multiple attempts.")
+            except FileNotFoundError:
+                self.show_error("Ollama command not found. Ensure Ollama is installed and in your PATH.")
+                messagebox.showerror("Ollama Error", "Ollama command not found. Please ensure Ollama is installed and in your system's PATH.")
+            except Exception as e:
+                self.show_error(f"Failed to start Ollama server: {e}")
+                messagebox.showerror("Ollama Error", f"Failed to start Ollama server: {e}")
+
+    # --- Override __init__ to add config load and keyboard shortcuts setup ---
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Ollama Translator (Python)")
+
+        # Initialize tkinter variables early to avoid attribute errors
+        self.api_endpoint_var = tk.StringVar(value=DEFAULT_OLLAMA_API_BASE_URL)
+        self.direction_var = tk.StringVar(value="de-en")
+
+        self.active_model = None
+        self.translation_controller = None
+
+        self.style = Style(root)
+        self.current_theme = "light"
+
+        # Main Frames setup (same as before)...
+        self.header_frame = ttk.Frame(root, padding="10")
+        self.header_frame.grid(row=0, column=0, sticky="ew")
+
+        self.model_mgmt_frame = ttk.LabelFrame(root, text="Model Management", padding="10")
+        self.model_mgmt_frame.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
+
+        self.translation_frame = ttk.LabelFrame(root, text="Translation", padding="10")
+        self.translation_frame.grid(row=2, column=0, padx=10, pady=5, sticky="nsew")
+
+        self.progress_frame = ttk.Frame(root, padding="10")
+        self.progress_frame.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
+
+        self.footer_frame = ttk.Frame(root, padding="10")
+        self.footer_frame.grid(row=4, column=0, sticky="ew")
+
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(2, weight=1)
+        self.translation_frame.columnconfigure(0, weight=1)
+        self.translation_frame.columnconfigure(1, weight=1)
+        self.translation_frame.rowconfigure(1, weight=1)
+
+        self.create_header_widgets()
+        self.create_model_management_widgets()
+
+        # Load config before applying theme
+        self._load_config()
+
+        self.apply_theme()
+
+        self.create_translation_widgets()
+        self.create_progress_widgets()
+        self.create_footer_widgets()
+
+        # Setup keyboard shortcuts
+        self._setup_keyboard_shortcuts()
+
+        # Initial actions
+        self.start_ollama_server()
+        self.refresh_available_models()
+
+        # Bind close event to save config
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _on_close(self):
+        self._save_config()
+        self.root.destroy()
+
+    # --- Thread-safe GUI update example for translation cancellation ---
+    def cancel_translation(self):
+        """Request cancellation of the ongoing translation."""
+        if self.translation_controller:
+            self.translation_controller['abort'] = True
+            print("Cancellation requested.")
+            self.cancel_button.config(state=tk.DISABLED)
+
+    def _apply_theme_to_widgets(self, theme):
+        """Apply theme styles to widgets, used during theme toggle or updates."""
+        self._configure_ttk_styles(theme)
+        self._configure_non_ttk_widgets(theme)
+
+    def toggle_theme(self):
+        """Toggle between light and dark themes."""
+        self.current_theme = "dark" if self.current_theme == "light" else "light"
+        self.apply_theme()
+
+    # Other methods remain unchanged but with added or improved docstrings
+
 
         self.style.configure('TLabel', background=theme["bg"], foreground=theme["fg"])
         self.style.configure('TFrame', background=theme["bg"])
@@ -147,7 +387,13 @@ class OllamaTranslatorApp:
     # --- Widget Creation Methods ---
     def create_header_widgets(self):
         ttk.Label(self.header_frame, text="Ollama Translator", font=("Arial", 16)).pack(side=tk.LEFT, padx=5)
-        
+
+        # API Endpoint input
+        ttk.Label(self.header_frame, text="API Endpoint:").pack(side=tk.LEFT, padx=(20, 5))
+        self.api_endpoint_var = tk.StringVar(value=DEFAULT_OLLAMA_API_BASE_URL)
+        self.api_endpoint_entry = ttk.Entry(self.header_frame, textvariable=self.api_endpoint_var, width=40)
+        self.api_endpoint_entry.pack(side=tk.LEFT, padx=5)
+
         ttk.Label(self.header_frame, text="Direction:").pack(side=tk.LEFT, padx=(20, 5))
         self.direction_var = tk.StringVar(value="de-en")
         direction_combo = ttk.Combobox(self.header_frame, textvariable=self.direction_var, 
@@ -229,22 +475,34 @@ class OllamaTranslatorApp:
 
     # --- Helper Methods --- 
     def start_ollama_server(self):
+        import time
         try:
             # Try to connect to the server first to see if it's already running
-            requests.get(OLLAMA_API_BASE_URL, timeout=1) # Short timeout
+            requests.get(self.get_api_base_url(), timeout=1) # Short timeout
             print("Ollama server already running.")
         except requests.exceptions.RequestException:
             print("Ollama server not running. Attempting to start...")
             try:
-                # For Windows, use CREATE_NO_WINDOW to hide the console
-                # Adjust the command if 'ollama' is not in PATH or has a specific path
                 if os.name == 'nt': # Windows
                     subprocess.Popen(["ollama", "serve"], creationflags=subprocess.CREATE_NO_WINDOW)
                 else: # macOS/Linux
                     subprocess.Popen(["ollama", "serve"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 print("Ollama serve command issued.")
-                # It might take a few seconds for the server to start
-                # Consider adding a small delay or a more robust check here if needed
+                # Wait for server readiness with retries
+                max_retries = 10
+                retry_delay = 1  # seconds
+                for i in range(max_retries):
+                    try:
+                        time.sleep(retry_delay)
+                        response = requests.get(self.get_api_base_url(), timeout=1)
+                        if response.status_code == 200:
+                            print("Ollama server is ready.")
+                            break
+                    except requests.exceptions.RequestException:
+                        print(f"Waiting for Ollama server to start... ({i+1}/{max_retries})")
+                else:
+                    self.show_error("Failed to start Ollama server after multiple attempts.")
+                    messagebox.showerror("Ollama Error", "Failed to start Ollama server after multiple attempts.")
             except FileNotFoundError:
                 self.show_error("Ollama command not found. Ensure Ollama is installed and in your PATH.")
                 messagebox.showerror("Ollama Error", "Ollama command not found. Please ensure Ollama is installed and in your system's PATH.")
@@ -271,15 +529,20 @@ class OllamaTranslatorApp:
         self.clear_error()
         self.available_models_listbox.delete(0, tk.END)
         self.available_models_listbox.insert(tk.END, "Loading...")
+        # Pass api_base_url safely to thread
+        self._api_base_url_for_thread = self.api_endpoint_var.get().strip()
         threading.Thread(target=self._fetch_models_thread, daemon=True).start()
 
     def _fetch_models_thread(self):
         try:
-            response = requests.get(f"{OLLAMA_API_BASE_URL}/tags")
-            response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+            # Use a local copy of api_base_url passed from main thread to avoid tkinter access in worker thread
+            api_base_url = self._api_base_url_for_thread
+
+            response = requests.get(f"{api_base_url}/tags")
+            response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
             data = response.json()
             models = [m['name'] for m in data.get('models', [])]
-            
+
             self.root.after(0, self._update_available_models_list, models)
 
         except requests.exceptions.ConnectionError:
@@ -289,8 +552,8 @@ class OllamaTranslatorApp:
             self.root.after(0, self.show_error, f"API Error: {e}")
             self.root.after(0, self._update_available_models_list, [])
         except json.JSONDecodeError:
-             self.root.after(0, self.show_error, "API Error: Invalid JSON response.")
-             self.root.after(0, self._update_available_models_list, [])
+            self.root.after(0, self.show_error, "API Error: Invalid JSON response.")
+            self.root.after(0, self._update_available_models_list, [])
 
     def _update_available_models_list(self, models):
         self.available_models_listbox.delete(0, tk.END)
@@ -351,11 +614,13 @@ class OllamaTranslatorApp:
     def start_translation(self):
         if not self.active_model:
             messagebox.showerror("Error", "No model selected for translation.")
+            messagebox.showerror("Error", "No model selected for translation.")  # Ensure error dialog shown
             return
-            
+
         input_content = self.input_text.get("1.0", "end-1c").strip()
         if not input_content:
             messagebox.showerror("Error", "Input text cannot be empty.")
+            messagebox.showerror("Error", "Input text cannot be empty.")  # Ensure error dialog shown
             return
 
         self.clear_error()
@@ -363,11 +628,11 @@ class OllamaTranslatorApp:
         self.output_text.delete('1.0', tk.END)
         self.output_text.insert('1.0', "Translating...")
         self.output_text.config(state=tk.DISABLED)
-        
+
         self.progress_bar['value'] = 0
-        self.progress_bar['mode'] = 'indeterminate' # Use indeterminate for streaming
+        self.progress_bar['mode'] = 'indeterminate'  # Use indeterminate for streaming
         self.progress_bar.start()
-        
+
         self.translate_button.config(state=tk.DISABLED)
         self.cancel_button.config(state=tk.NORMAL)
 
@@ -382,13 +647,13 @@ class OllamaTranslatorApp:
             payload = {
                 "model": self.active_model,
                 "prompt": prompt,
-                "stream": True # Use streaming API
+                "stream": True  # Use streaming API
             }
-            
+
             full_response = ""
-            
+
             # Make the streaming request
-            response = requests.post(f"{OLLAMA_API_BASE_URL}/generate", json=payload, stream=True)
+            response = requests.post(f"{self.get_api_base_url()}/generate", json=payload, stream=True)
             response.raise_for_status()
 
             self.root.after(0, lambda: self.output_text.config(state=tk.NORMAL))
@@ -398,7 +663,7 @@ class OllamaTranslatorApp:
                 if controller['abort']:
                     print("Translation aborted by user.")
                     self.root.after(0, self.show_error, "Translation cancelled.")
-                    break # Exit the loop if cancelled
+                    break  # Exit the loop if cancelled
 
                 if line:
                     try:
@@ -408,18 +673,18 @@ class OllamaTranslatorApp:
                             full_response += response_part
                             # Update GUI from the main thread
                             self.root.after(0, lambda p=response_part: self.output_text.insert(tk.END, p))
-                            self.root.after(0, lambda: self.output_text.see(tk.END)) # Scroll to end
-                        
+                            self.root.after(0, lambda: self.output_text.see(tk.END))  # Scroll to end
+
                         # Check if generation is done (Ollama specific)
                         if chunk.get('done', False):
                             break
                     except json.JSONDecodeError:
                         print(f"Warning: Could not decode JSON line: {line}")
-                        continue # Skip malformed lines
-            
+                        continue  # Skip malformed lines
+
             if controller['abort']:
-                 # Ensure final state reflects cancellation
-                 self.root.after(0, lambda: self.output_text.config(state=tk.DISABLED))
+                # Ensure final state reflects cancellation
+                self.root.after(0, lambda: self.output_text.config(state=tk.DISABLED))
             else:
                 # Final update after stream finishes normally
                 # self.root.after(0, lambda: self.output_text.delete('1.0', tk.END))
@@ -429,10 +694,13 @@ class OllamaTranslatorApp:
 
         except requests.exceptions.ConnectionError:
             self.root.after(0, self.show_error, "Connection Error during translation.")
+            self.root.after(0, lambda: messagebox.showerror("Translation Error", "Connection Error during translation."))
         except requests.exceptions.RequestException as e:
             self.root.after(0, self.show_error, f"API Error during translation: {e}")
+            self.root.after(0, lambda: messagebox.showerror("Translation Error", f"API Error during translation: {e}"))
         except Exception as e:
             self.root.after(0, self.show_error, f"Unexpected error during translation: {e}")
+            self.root.after(0, lambda: messagebox.showerror("Translation Error", f"Unexpected error during translation: {e}"))
             import traceback
             traceback.print_exc()
         finally:
@@ -453,7 +721,8 @@ class OllamaTranslatorApp:
             self.translation_controller['abort'] = True
             print("Cancellation requested.")
             # The thread will check the flag and stop
-            self.cancel_button.config(state=tk.DISABLED) # Prevent multiple clicks
+            self.cancel_button.config(state=tk.DISABLED)  # Prevent multiple clicks
+            self.update_translate_button_state()  # Ensure button states are updated after cancellation
 
     # --- File I/O Methods --- 
     def upload_txt(self):
@@ -473,6 +742,9 @@ class OllamaTranslatorApp:
         except Exception as e:
             messagebox.showerror("File Read Error", f"Could not read file: {e}")
             self.show_error(f"Error reading file: {filepath}")
+
+    def get_api_base_url(self):
+        return self.api_endpoint_var.get().strip()
 
     def save_txt(self):
         output_content = self.output_text.get("1.0", "end-1c").strip()
