@@ -12,7 +12,7 @@ from tkinter import filedialog, messagebox
 from tkinter import ttk
 from tkinter.ttk import Style
 import requests
-from PyPDF2 import PdfReader
+from pypdf import PdfReader
 
 # Optional OCR / document preprocessing
 try:
@@ -32,6 +32,7 @@ except Exception:
 
 # Default Ollama API endpoint
 DEFAULT_OLLAMA_API_BASE_URL = "http://localhost:11434/api"
+DEFAULT_CHUNK_CHAR_LIMIT = 1600  # Chunk long texts to avoid model/context breakdowns
 
 # --- Theme Definitions ---
 LIGHT_THEME = {
@@ -632,11 +633,70 @@ class OllamaTranslatorApp:
 
     # --- Translation Methods --- 
     def get_translation_prompt(self):
+        """
+        Build a strict, explicit prompt so the model respects the requested language
+        and translates the entire input (no summaries or omissions).
+        """
         direction = self.direction_var.get()
         source_lang = "German" if direction == "de-en" else "English"
         target_lang = "English" if direction == "de-en" else "German"
-        # Basic prompt - can be refined
-        return f"Translate the following text from {source_lang} to {target_lang}. Output only the translation, without any introductory phrases or explanations:\n\n"
+
+        direction_notes = (
+            "Use clear, idiomatic US/UK business English. Preserve any honorifics and tone markers."
+            if target_lang == "English"
+            else "Schreibe natürlich klingendes, idiomatisches Deutsch. Verwende standardmäßig die Höflichkeitsform „Sie“, es sei denn, der Eingangstext ist eindeutig informell und durchgängig mit „du“ gehalten."
+        )
+
+        return (
+            "You are a professional translator.\n"
+            f"- Source language: {source_lang}\n"
+            f"- Target language: {target_lang}\n"
+            "- Translate *every* sentence and word; do not skip, summarise, or shorten.\n"
+            "- Preserve all formatting exactly (line breaks, bullet lists, headings, Markdown, numbering, inline code).\n"
+            "- Keep units, dates, names, and code as-is unless conversion is explicitly required.\n"
+            "- Output only the translated text in the target language—no prefaces, notes, or explanations.\n"
+            f"- Style guidance: {direction_notes}\n\n"
+        )
+
+    def _chunk_text_for_translation(self, text, max_chars=DEFAULT_CHUNK_CHAR_LIMIT):
+        """
+        Split long input into reasonably sized chunks while preserving paragraph
+        boundaries when possible. Ensures the model is not overwhelmed and every
+        part is translated.
+        """
+        chunks = []
+        buffer = []
+        current_len = 0
+        paragraphs = text.split("\n\n")
+        for para in paragraphs:
+            seg = para.strip("\n")
+            if not seg:
+                # preserve blank paragraph as newline between buffers
+                if buffer:
+                    buffer.append("")
+                    current_len += 2
+                continue
+            # If the paragraph fits in the current buffer
+            if current_len + len(seg) + 2 <= max_chars:
+                buffer.append(seg)
+                current_len += len(seg) + 2
+            else:
+                if buffer:
+                    chunks.append("\n\n".join(buffer).strip())
+                buffer = []
+                current_len = 0
+                # If the paragraph itself is too long, hard-split it
+                if len(seg) > max_chars:
+                    start = 0
+                    while start < len(seg):
+                        chunks.append(seg[start:start+max_chars])
+                        start += max_chars
+                else:
+                    buffer.append(seg)
+                    current_len = len(seg)
+        if buffer:
+            chunks.append("\n\n".join(buffer).strip())
+        return [c for c in chunks if c.strip()]
 
     def update_translation_prompt(self, event=None): # event=None allows calling it directly
         # This method could potentially update a label showing the prompt, 
@@ -679,56 +739,85 @@ class OllamaTranslatorApp:
     def _translate_thread(self, text_to_translate, controller):
         try:
             start_time = controller.get('start_time', time.time()) if isinstance(controller, dict) else time.time()
-            prompt = self.get_translation_prompt() + text_to_translate
-            payload = {
-                "model": self.active_model,
-                "prompt": prompt,
-                "stream": True  # Use streaming API
-            }
 
-            full_response = ""
-
-            # Make the streaming request
-            response = requests.post(f"{self.get_api_base_url()}/generate", json=payload, stream=True)
-            response.raise_for_status()
+            chunks = self._chunk_text_for_translation(text_to_translate)
+            if not chunks:
+                raise ValueError("Nothing to translate after preprocessing.")
 
             self._dispatch_ui(lambda: self.output_text.config(state=tk.NORMAL))
             self._dispatch_ui(lambda: self.output_text.delete('1.0', tk.END))
+            self._dispatch_ui(lambda: self.progress_bar.config(mode='determinate', maximum=len(chunks), value=0))
 
-            for line in response.iter_lines():
-                if controller['abort']:
-                    print("Translation aborted by user.")
-                    self._dispatch_ui(self.show_error, "Translation cancelled.")
-                    break  # Exit the loop if cancelled
+            full_response_parts = []
+            for idx, chunk_text in enumerate(chunks, start=1):
+                if controller.get('abort'):
+                    break
+                prompt = self.get_translation_prompt() + chunk_text
+                payload = {
+                    "model": self.active_model,
+                    "prompt": prompt,
+                    "stream": True  # Use streaming API
+                }
 
-                if line:
+                # Make the streaming request per chunk
+                response = requests.post(f"{self.get_api_base_url()}/generate", json=payload, stream=True)
+                response.raise_for_status()
+
+                # Separate chunks visually in UI
+                if idx > 1:
+                    self._dispatch_ui(lambda: self.output_text.insert(tk.END, "\n\n"))
+
+                self._dispatch_ui(lambda i=idx, n=len(chunks): self.status_label.config(
+                    text=f"Translating ({i}/{n})...", foreground="blue"))
+
+                chunk_response = ""
+                for line in response.iter_lines():
+                    if controller.get('abort'):
+                        print("Translation aborted by user.")
+                        self._dispatch_ui(self.show_error, "Translation cancelled.")
+                        break
+                    if not line:
+                        continue
                     try:
-                        chunk = json.loads(line.decode('utf-8'))
-                        response_part = chunk.get('response', '')
+                        piece = json.loads(line.decode('utf-8'))
+                        response_part = piece.get('response', '')
                         if response_part:
-                            full_response += response_part
-                            # Update GUI from the main thread
+                            chunk_response += response_part
                             self._dispatch_ui(lambda p=response_part: self.output_text.insert(tk.END, p))
-                            self._dispatch_ui(lambda: self.output_text.see(tk.END))  # Scroll to end
-
-                        # Check if generation is done (Ollama specific)
-                        if chunk.get('done', False):
+                            self._dispatch_ui(lambda: self.output_text.see(tk.END))
+                        if piece.get('done', False):
                             break
                     except json.JSONDecodeError:
                         print(f"Warning: Could not decode JSON line: {line}")
-                        continue  # Skip malformed lines
+                        continue
 
-            if controller['abort']:
+                full_response_parts.append(chunk_response)
+                self._dispatch_ui(lambda val=idx: self.progress_bar.config(value=val))
+
+            if controller.get('abort'):
                 # Ensure final state reflects cancellation
                 self._dispatch_ui(lambda: self.output_text.config(state=tk.DISABLED))
                 self._log_event("translate_cancelled", model=self.active_model, seconds=round(time.time()-start_time,2))
             else:
-                # Final update after stream finishes normally
-                # self._dispatch_ui(lambda: self.output_text.delete('1.0', tk.END))
-                # self._dispatch_ui(lambda: self.output_text.insert('1.0', full_response))
-                self._dispatch_ui(lambda: self.output_text.config(state=tk.DISABLED))
+                full_response = "\n\n".join(part.strip() for part in full_response_parts if part.strip())
+
+                def _apply_full_response():
+                    # Ensure the complete translation is in the output box (guards against any dropped stream chunks).
+                    self.output_text.config(state=tk.NORMAL)
+                    self.output_text.delete('1.0', tk.END)
+                    self.output_text.insert('1.0', full_response.strip())
+                    self.output_text.config(state=tk.DISABLED)
+                self._dispatch_ui(_apply_full_response)
+                if not full_response.strip():
+                    self._dispatch_ui(self.show_error, "No translation received.")
                 print("Translation finished.")
-                self._log_event("translate_ok", model=self.active_model, seconds=round(time.time()-start_time,2), chars=len(text_to_translate))
+                self._log_event(
+                    "translate_ok",
+                    model=self.active_model,
+                    seconds=round(time.time()-start_time,2),
+                    chars=len(text_to_translate),
+                    out_chars=len(full_response)
+                )
 
         except requests.exceptions.ConnectionError:
             self._dispatch_ui(self.show_error, "Connection Error during translation.")
@@ -870,7 +959,7 @@ class OllamaTranslatorApp:
 
     def _extract_pdf_text(self, filepath, controller=None, progress_cb=None):
         """
-        Try structured OCR with unstructured, fallback to PaddleOCR, finally PyPDF2 text extract.
+        Try structured OCR with unstructured, fallback to PaddleOCR, finally pypdf text extract.
         Returns combined text or empty string.
         """
         abort = lambda: controller is not None and controller.get('abort')
@@ -912,10 +1001,13 @@ class OllamaTranslatorApp:
                         progress_cb(idx, total, "OCR (Paddle)")
                 if ocr_chunks:
                     return "\n".join(ocr_chunks)
+            except ModuleNotFoundError as e:
+                # PaddleOCR installed but core paddle package missing; fall back silently.
+                print(f"PaddleOCR unavailable ({e}). Falling back to pypdf text extraction.")
             except Exception as e:
                 print(f"PaddleOCR fallback failed: {e}")
 
-        # 3) Fallback: basic text extraction via PyPDF2
+        # 3) Fallback: basic text extraction via pypdf
         try:
             reader = PdfReader(filepath)
             pages_text = []
@@ -928,7 +1020,7 @@ class OllamaTranslatorApp:
                     progress_cb(idx, total_pages, "Text-Extract")
             return "\n\n".join(pages_text).strip()
         except Exception as e:
-            print(f"PyPDF2 fallback failed: {e}")
+            print(f"pypdf fallback failed: {e}")
             return ""
 
     def get_api_base_url(self):
