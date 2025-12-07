@@ -3,12 +3,15 @@ import time
 import sys
 import json
 import logging
+import csv
+import re
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 import queue
 import threading
 import subprocess
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, simpledialog
 from tkinter import ttk
 from tkinter.ttk import Style
 import requests
@@ -30,9 +33,22 @@ try:
 except Exception:
     convert_from_path = None
 
+# Optional export helpers
+try:
+    from docx import Document
+except Exception:
+    Document = None
+
+try:
+    from fpdf import FPDF
+except Exception:
+    FPDF = None
 # Default Ollama API endpoint
 DEFAULT_OLLAMA_API_BASE_URL = "http://localhost:11434/api"
 DEFAULT_CHUNK_CHAR_LIMIT = 1600  # Chunk long texts to avoid model/context breakdowns
+DEFAULT_HISTORY_LIMIT = 10
+OFFLINE_QUEUE_PATH = os.path.join(os.path.expanduser("~"), ".ollama_translator_offline_queue.json")
+GLOSSARY_MAX_ITEMS = 50
 
 # --- Theme Definitions ---
 LIGHT_THEME = {
@@ -63,6 +79,32 @@ DARK_THEME = {
     "error_fg": "#ff8080", # Lighter red for dark bg
     "active_model_fg": "white",
     "inactive_model_fg": "#aaaaaa"
+}
+
+# Prompt profile texts per direction
+PROFILE_STYLES = {
+    "de-en": {
+        "standard": "Neutral business English, keep nuance and register.",
+        "woertlich": "Highly literal; mirror phrasing closely, keep compound nouns intact.",
+        "frei": "Freer rendering; reorganise sentences for clarity and flow.",
+        "formal": "Formal tone, polite forms, avoid contractions.",
+        "kreativ": "Creative marketing tone; persuasive, vivid wording."
+    },
+    "en-de": {
+        "standard": "Neutrales Hochdeutsch, flüssig und idiomatisch.",
+        "woertlich": "Sehr wortgetreu; Satzbau eng am Original.",
+        "frei": "Freier Stil; Satzbau an natürliches Deutsch anpassen.",
+        "formal": "Formell und höflich (Sie-Form), keine Umgangssprache.",
+        "kreativ": "Kreativer, werblicher Stil mit lebendigen Formulierungen."
+    }
+}
+
+DEFAULT_SHORTCUTS = {
+    "translate": "<Control-Return>",
+    "cancel": "<Escape>",
+    "clear": "<Control-l>",
+    "toggle_theme": "<Control-t>",
+    "refresh": "<Control-r>"
 }
 
 class OllamaTranslatorApp:
@@ -128,11 +170,23 @@ class OllamaTranslatorApp:
     # --- Keyboard Shortcuts ---
     def _setup_keyboard_shortcuts(self):
         """Bind keyboard shortcuts to their respective handlers."""
-        self.root.bind_all("<Control-Return>", lambda e: self._keyboard_translate())
-        self.root.bind_all("<Escape>", lambda e: self._keyboard_cancel())
-        self.root.bind_all("<Control-l>", lambda e: self._keyboard_clear_input())
-        self.root.bind_all("<Control-t>", lambda e: self._keyboard_toggle_theme())
-        self.root.bind_all("<Control-r>", lambda e: self._keyboard_refresh_models())
+        bindings = {
+            "translate": self._keyboard_translate,
+            "cancel": self._keyboard_cancel,
+            "clear": self._keyboard_clear_input,
+            "toggle_theme": self._keyboard_toggle_theme,
+            "refresh": self._keyboard_refresh_models
+        }
+        for action, handler in bindings.items():
+            key = self.shortcuts.get(action)
+            if not key:
+                continue
+            try:
+                self.root.unbind_all(key)
+                self.root.bind_all(key, lambda e, h=handler: h())
+            except tk.TclError:
+                # Ignore invalid key patterns
+                continue
 
     def _keyboard_translate(self):
         """Handle Ctrl+Enter to start translation."""
@@ -161,6 +215,37 @@ class OllamaTranslatorApp:
         """Handle Ctrl+R to refresh available models."""
         self.refresh_available_models()
 
+    def _open_shortcut_dialog(self):
+        """Allow users to customise a few keyboard shortcuts."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Shortcuts")
+        ttk.Label(dlg, text="Aktion").grid(row=0, column=0, padx=5, pady=5)
+        ttk.Label(dlg, text="Taste (Tk Syntax)").grid(row=0, column=1, padx=5, pady=5)
+        actions = [
+            ("Übersetzen", "translate"),
+            ("Abbrechen", "cancel"),
+            ("Eingabe leeren", "clear"),
+            ("Theme wechseln", "toggle_theme"),
+            ("Modelle aktualisieren", "refresh")
+        ]
+        entries = {}
+        for idx, (label, key) in enumerate(actions, start=1):
+            ttk.Label(dlg, text=label).grid(row=idx, column=0, padx=5, pady=2, sticky="w")
+            var = tk.StringVar(value=self.shortcuts.get(key, DEFAULT_SHORTCUTS.get(key, "")))
+            ent = ttk.Entry(dlg, textvariable=var, width=20)
+            ent.grid(row=idx, column=1, padx=5, pady=2)
+            entries[key] = var
+
+        def save_and_close():
+            for k, var in entries.items():
+                val = var.get().strip()
+                self.shortcuts[k] = val or DEFAULT_SHORTCUTS.get(k, "")
+            self._setup_keyboard_shortcuts()
+            self._save_config()
+            dlg.destroy()
+
+        ttk.Button(dlg, text="Speichern", command=save_and_close).grid(row=len(actions)+1, column=0, columnspan=2, pady=8)
+
     # --- Configuration Persistence ---
     def _load_config(self):
         """Load user configuration from a JSON file."""
@@ -172,11 +257,22 @@ class OllamaTranslatorApp:
                 self.current_theme = config.get("theme", "light")
                 self.api_endpoint_var.set(config.get("api_endpoint", DEFAULT_OLLAMA_API_BASE_URL))
                 self.direction_var.set(config.get("direction", "de-en"))
+                self.prompt_profile_var.set(config.get("prompt_profile", "standard"))
+                self.shortcuts.update(config.get("shortcuts", {}))
+                self.auto_theme_var.set(config.get("auto_theme", False))
+                self.security_mode_var.set(config.get("security_mode", False))
+                self.auto_detect_var.set(config.get("auto_detect", True))
+                self.history_limit = config.get("history_limit", DEFAULT_HISTORY_LIMIT)
+                self.model_settings = config.get("model_settings", {}) or {}
+                glossary_path = config.get("glossary_path")
+                if glossary_path:
+                    self._load_glossary_from_path(glossary_path)
                 last_model = config.get("last_model", None)
                 if last_model:
                     self.active_model = last_model
                     active_fg = LIGHT_THEME["active_model_fg"] if self.current_theme == "light" else DARK_THEME["active_model_fg"]
                     self.active_model_label.config(text=self.active_model, foreground=active_fg)
+                    self._apply_model_settings(last_model)
                 self.apply_theme()
             except Exception as e:
                 print(f"Failed to load config: {e}")
@@ -188,7 +284,15 @@ class OllamaTranslatorApp:
             "theme": self.current_theme,
             "api_endpoint": self.api_endpoint_var.get(),
             "direction": self.direction_var.get(),
-            "last_model": self.active_model
+            "prompt_profile": self.prompt_profile_var.get(),
+            "last_model": self.active_model,
+            "shortcuts": self.shortcuts,
+            "auto_theme": self.auto_theme_var.get(),
+            "security_mode": self.security_mode_var.get(),
+            "auto_detect": self.auto_detect_var.get(),
+            "history_limit": self.history_limit,
+            "model_settings": self.model_settings,
+            "glossary_path": self.glossary.get("path")
         }
         try:
             with open(config_path, "w", encoding="utf-8") as f:
@@ -204,12 +308,23 @@ class OllamaTranslatorApp:
         # Initialize tkinter variables early to avoid attribute errors
         self.api_endpoint_var = tk.StringVar(value=DEFAULT_OLLAMA_API_BASE_URL)
         self.direction_var = tk.StringVar(value="de-en")
+        self.prompt_profile_var = tk.StringVar(value="standard")
         # Disable background threads in unit test context to avoid Tk thread errors
         self.use_threads = 'unittest' not in sys.modules
 
         self.active_model = None
         self.translation_controller = None
         self.ocr_controller = None
+        self.history = []
+        self.batch_queue = []
+        self.batch_results = []
+        self.glossary = {"map": {}, "dnt": set(), "path": None}
+        self.model_settings = {}
+        self.shortcuts = DEFAULT_SHORTCUTS.copy()
+        self.auto_theme_var = tk.BooleanVar(value=False)
+        self.security_mode_var = tk.BooleanVar(value=False)
+        self.auto_detect_var = tk.BooleanVar(value=True)
+        self.history_limit = DEFAULT_HISTORY_LIMIT
 
         self.style = Style(root)
         self.current_theme = "light"
@@ -257,6 +372,8 @@ class OllamaTranslatorApp:
         self._load_config()
 
         self.apply_theme()
+        if self.auto_theme_var.get():
+            self._apply_auto_theme()
 
         self.create_translation_widgets()
         self.create_progress_widgets()
@@ -337,23 +454,53 @@ class OllamaTranslatorApp:
         self.current_theme = "dark" if self.current_theme == "light" else "light"
         self.apply_theme()
 
+    def _apply_auto_theme(self):
+        """Switch theme based on time of day (light 07-19h, dark otherwise)."""
+        hour = datetime.now().hour
+        desired = "light" if 7 <= hour < 19 else "dark"
+        if self.current_theme != desired:
+            self.current_theme = desired
+            self.apply_theme()
+        # Reschedule check every 10 minutes when auto mode is active
+        if self.auto_theme_var.get():
+            self.root.after(600000, self._apply_auto_theme)
+
     # --- Widget Creation Methods ---
     def create_header_widgets(self):
         ttk.Label(self.header_frame, text="Ollama Translator", font=("Arial", 16)).pack(side=tk.LEFT, padx=5)
 
         # API Endpoint input
         ttk.Label(self.header_frame, text="API Endpoint:").pack(side=tk.LEFT, padx=(20, 5))
-        self.api_endpoint_var = tk.StringVar(value=DEFAULT_OLLAMA_API_BASE_URL)
+        if not hasattr(self, "api_endpoint_var"):
+            self.api_endpoint_var = tk.StringVar(value=DEFAULT_OLLAMA_API_BASE_URL)
         self.api_endpoint_entry = ttk.Entry(self.header_frame, textvariable=self.api_endpoint_var, width=40)
         self.api_endpoint_entry.pack(side=tk.LEFT, padx=5)
 
         ttk.Label(self.header_frame, text="Direction:").pack(side=tk.LEFT, padx=(20, 5))
-        self.direction_var = tk.StringVar(value="de-en")
+        if not hasattr(self, "direction_var"):
+            self.direction_var = tk.StringVar(value="de-en")
         direction_combo = ttk.Combobox(self.header_frame, textvariable=self.direction_var, 
                                        values=["de-en", "en-de"], state="readonly", width=15)
         direction_combo.pack(side=tk.LEFT, padx=5)
         direction_combo.bind("<<ComboboxSelected>>", self.update_translation_prompt) # Update prompt on change
+
+        ttk.Checkbutton(self.header_frame, text="Auto-Detect", variable=self.auto_detect_var).pack(side=tk.LEFT, padx=(5,10))
+
+        ttk.Label(self.header_frame, text="Profil:").pack(side=tk.LEFT, padx=(20,5))
+        if not hasattr(self, "prompt_profile_var"):
+            self.prompt_profile_var = tk.StringVar(value="standard")
+        profile_combo = ttk.Combobox(
+            self.header_frame,
+            textvariable=self.prompt_profile_var,
+            values=["standard", "woertlich", "frei", "formal", "kreativ"],
+            state="readonly",
+            width=15
+        )
+        profile_combo.pack(side=tk.LEFT, padx=5)
+        profile_combo.bind("<<ComboboxSelected>>", self.update_translation_prompt)
+
         ttk.Button(self.header_frame, text="Ollama Check", command=self.run_ollama_check).pack(side=tk.LEFT, padx=(20,5))
+        ttk.Button(self.header_frame, text="Shortcuts", command=self._open_shortcut_dialog).pack(side=tk.LEFT, padx=5)
 
     def create_model_management_widgets(self):
         # Available Models Section
@@ -377,6 +524,23 @@ class OllamaTranslatorApp:
         # Adding a deactivate button
         ttk.Button(active_frame, text="Deactivate Model", command=self.deactivate_model).pack(pady=5)
 
+        # Model settings persistence
+        settings_frame = ttk.LabelFrame(self.model_mgmt_frame, text="Model Settings")
+        settings_frame.grid(row=1, column=0, columnspan=2, sticky="ew", padx=5, pady=(5,0))
+        ttk.Label(settings_frame, text="Temperature").grid(row=0, column=0, padx=5, pady=2, sticky="w")
+        self.temp_var = tk.DoubleVar(value=0.2)
+        ttk.Spinbox(settings_frame, from_=0.0, to=1.0, increment=0.05, textvariable=self.temp_var, width=6).grid(row=0, column=1, padx=5)
+
+        ttk.Label(settings_frame, text="Top-p").grid(row=0, column=2, padx=5, pady=2, sticky="w")
+        self.top_p_var = tk.DoubleVar(value=0.9)
+        ttk.Spinbox(settings_frame, from_=0.0, to=1.0, increment=0.05, textvariable=self.top_p_var, width=6).grid(row=0, column=3, padx=5)
+
+        ttk.Label(settings_frame, text="Max tokens").grid(row=0, column=4, padx=5, pady=2, sticky="w")
+        self.max_tokens_var = tk.IntVar(value=512)
+        ttk.Entry(settings_frame, textvariable=self.max_tokens_var, width=8).grid(row=0, column=5, padx=5)
+
+        ttk.Button(settings_frame, text="Save per Model", command=self._save_model_settings_for_active).grid(row=0, column=6, padx=5)
+
         self.model_mgmt_frame.columnconfigure(0, weight=1)
         self.model_mgmt_frame.columnconfigure(1, weight=1)
 
@@ -393,10 +557,21 @@ class OllamaTranslatorApp:
         ttk.Button(input_buttons, text="Upload TXT", command=self.upload_txt).pack(side=tk.LEFT, padx=2)
         ttk.Button(input_buttons, text="Upload PDF (OCR)", command=self.upload_pdf).pack(side=tk.LEFT, padx=2)
         ttk.Button(input_buttons, text="Clear", command=lambda: self.input_text.delete('1.0', tk.END)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(input_buttons, text="Glossar laden", command=self._load_glossary).pack(side=tk.LEFT, padx=2)
         self.translate_button = tk.Button(input_buttons, text="Translate", command=self.start_translation, state=tk.DISABLED)
         self.translate_button.pack(side=tk.LEFT, padx=2)
         self.cancel_button = tk.Button(input_buttons, text="Cancel", command=self.cancel_translation, state=tk.DISABLED)
         self.cancel_button.pack(side=tk.LEFT, padx=2)
+
+        batch_buttons = ttk.Frame(input_frame)
+        batch_buttons.grid(row=4, column=0, pady=5, sticky="w")
+        ttk.Button(batch_buttons, text="Batch: Input hinzufgen", command=self._batch_add_current).pack(side=tk.LEFT, padx=2)
+        ttk.Button(batch_buttons, text="Batch: Dateien", command=self._batch_add_files).pack(side=tk.LEFT, padx=2)
+        ttk.Button(batch_buttons, text="Batch starten", command=self._start_batch).pack(side=tk.LEFT, padx=2)
+        ttk.Button(batch_buttons, text="Batch export", command=self._export_batch_results).pack(side=tk.LEFT, padx=2)
+
+        self.glossary_label = ttk.Label(input_frame, text="Glossar: keines")
+        self.glossary_label.grid(row=5, column=0, sticky="w", pady=(2,0))
 
         # OCR quality options
         ocr_opts = ttk.Frame(input_frame)
@@ -416,12 +591,40 @@ class OllamaTranslatorApp:
         output_buttons.grid(row=2, column=0, pady=5, sticky="ew")
 
         ttk.Button(output_buttons, text="Save TXT", command=self.save_txt).pack(side=tk.LEFT, padx=2)
+        ttk.Button(output_buttons, text="Save MD", command=self.save_markdown).pack(side=tk.LEFT, padx=2)
+        ttk.Button(output_buttons, text="Save DOCX", command=self.save_docx).pack(side=tk.LEFT, padx=2)
+        ttk.Button(output_buttons, text="Export PDF", command=self.save_pdf).pack(side=tk.LEFT, padx=2)
         ttk.Button(output_buttons, text="Copy", command=self.copy_to_clipboard).pack(side=tk.LEFT, padx=2)
 
         input_frame.rowconfigure(1, weight=1)
         input_frame.columnconfigure(0, weight=1)
         output_frame.rowconfigure(1, weight=1)
         output_frame.columnconfigure(0, weight=1)
+
+        # History & Batch overview
+        extra_frame = ttk.Frame(self.translation_frame)
+        extra_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=5, pady=(5,0))
+
+        history_box = ttk.Labelframe(extra_frame, text="History (letzte %d)" % self.history_limit)
+        history_box.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
+        self.history_list = tk.Listbox(history_box, height=4, exportselection=False)
+        self.history_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        hist_btns = ttk.Frame(history_box)
+        hist_btns.pack(side=tk.LEFT, padx=5)
+        ttk.Button(hist_btns, text="Copy Output", command=self._history_copy).pack(pady=2)
+        ttk.Button(hist_btns, text="Retry", command=self._history_retry).pack(pady=2)
+
+        batch_box = ttk.Labelframe(extra_frame, text="Batch Queue")
+        batch_box.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        self.batch_list = tk.Listbox(batch_box, height=4, exportselection=False)
+        self.batch_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        batch_btns = ttk.Frame(batch_box)
+        batch_btns.pack(side=tk.LEFT, padx=5)
+        ttk.Button(batch_btns, text="Entfernen", command=self._batch_remove_selected).pack(pady=2)
+        ttk.Button(batch_btns, text="Leeren", command=self._batch_clear).pack(pady=2)
+
+        extra_frame.columnconfigure(0, weight=1)
+        extra_frame.columnconfigure(1, weight=1)
 
     def create_progress_widgets(self):
         ttk.Label(self.progress_frame, text="Progress:").pack(side=tk.LEFT, padx=5)
@@ -440,8 +643,13 @@ class OllamaTranslatorApp:
         # Theme toggle button
         self.theme_button = ttk.Button(self.footer_frame, text="Toggle Theme", command=self.toggle_theme)
         self.theme_button.pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(self.footer_frame, text="Auto Theme", variable=self.auto_theme_var,
+                        command=self._apply_auto_theme).pack(side=tk.LEFT, padx=5)
         # Logging toggle
         ttk.Checkbutton(self.footer_frame, text="File-Log aktiv", variable=self.log_enabled_var).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(self.footer_frame, text="Sicherheitsmodus", variable=self.security_mode_var).pack(side=tk.LEFT, padx=5)
+        ttk.Button(self.footer_frame, text="Offline-Queue senden", command=self._process_offline_queue).pack(side=tk.LEFT, padx=5)
+        ttk.Button(self.footer_frame, text="Bewerten", command=self._open_feedback_dialog).pack(side=tk.LEFT, padx=5)
 
     # --- Helper Methods --- 
     def start_ollama_server(self):
@@ -619,6 +827,7 @@ class OllamaTranslatorApp:
         self.active_model = selected_model
         active_fg = LIGHT_THEME["active_model_fg"] if self.current_theme == "light" else DARK_THEME["active_model_fg"]
         self.active_model_label.config(text=self.active_model, foreground=active_fg)
+        self._apply_model_settings(selected_model)
         self.update_translate_button_state()
         self.update_translation_prompt() # Update prompt when model changes
         print(f"Activated model: {self.active_model}")
@@ -630,6 +839,25 @@ class OllamaTranslatorApp:
         self.update_translate_button_state()
         self.update_translation_prompt()
         print("Deactivated model")
+
+    def _apply_model_settings(self, model_name):
+        settings = self.model_settings.get(model_name)
+        if settings:
+            self.temp_var.set(settings.get("temperature", 0.2))
+            self.top_p_var.set(settings.get("top_p", 0.9))
+            self.max_tokens_var.set(settings.get("max_tokens", 512))
+
+    def _save_model_settings_for_active(self):
+        if not self.active_model:
+            messagebox.showwarning("Kein Modell", "Bitte zuerst ein Modell aktivieren.")
+            return
+        self.model_settings[self.active_model] = {
+            "temperature": float(self.temp_var.get()),
+            "top_p": float(self.top_p_var.get()),
+            "max_tokens": int(self.max_tokens_var.get() or 0)
+        }
+        self._log_event("model_settings_saved", model=self.active_model)
+        messagebox.showinfo("Gespeichert", f"Settings fr {self.active_model} gespeichert.")
 
     # --- Translation Methods --- 
     def get_translation_prompt(self):
@@ -644,8 +872,12 @@ class OllamaTranslatorApp:
         direction_notes = (
             "Use clear, idiomatic US/UK business English. Preserve any honorifics and tone markers."
             if target_lang == "English"
-            else "Schreibe natürlich klingendes, idiomatisches Deutsch. Verwende standardmäßig die Höflichkeitsform „Sie“, es sei denn, der Eingangstext ist eindeutig informell und durchgängig mit „du“ gehalten."
+            else "Schreibe natrlich klingendes, idiomatisches Deutsch. Verwende standardm„áig die H”flichkeitsform ,Sie\", es sei denn, der Eingangstext ist eindeutig informell und durchg„ngig mit ,du\" gehalten."
         )
+
+        profile_key = self.prompt_profile_var.get()
+        profile_notes = PROFILE_STYLES.get(direction, {}).get(profile_key, PROFILE_STYLES.get(direction, {}).get("standard", ""))
+        profile_label = profile_key if profile_key != "standard" else "standard"
 
         return (
             "You are a professional translator.\n"
@@ -654,10 +886,21 @@ class OllamaTranslatorApp:
             "- Translate *every* sentence and word; do not skip, summarise, or shorten.\n"
             "- Preserve all formatting exactly (line breaks, bullet lists, headings, Markdown, numbering, inline code).\n"
             "- Keep units, dates, names, and code as-is unless conversion is explicitly required.\n"
-            "- Output only the translated text in the target language—no prefaces, notes, or explanations.\n"
-            f"- Style guidance: {direction_notes}\n\n"
+            "- Output only the translated text in the target language-no prefaces, notes, or explanations.\n"
+            f"- Style guidance ({profile_label}): {profile_notes or direction_notes}\n"
+            f"- Additional direction hints: {direction_notes}\n\n"
         )
 
+    def _build_prompt(self, chunk_text):
+        base = self.get_translation_prompt()
+        glossary_text = ""
+        if self.glossary["map"]:
+            pairs = list(self.glossary["map"].items())[:GLOSSARY_MAX_ITEMS]
+            glossary_lines = [f"- {src} -> {tgt}" for src, tgt in pairs]
+            glossary_text += "Use the following glossary exactly (no paraphrasing):\n" + "\n".join(glossary_lines) + "\n"
+        if self.glossary["dnt"]:
+            glossary_text += "Keep placeholders like <<DNT_#>> unchanged and return them verbatim.\n"
+        return base + glossary_text + chunk_text
     def _chunk_text_for_translation(self, text, max_chars=DEFAULT_CHUNK_CHAR_LIMIT):
         """
         Split long input into reasonably sized chunks while preserving paragraph
@@ -698,12 +941,63 @@ class OllamaTranslatorApp:
             chunks.append("\n\n".join(buffer).strip())
         return [c for c in chunks if c.strip()]
 
+    def _mask_sensitive(self, text):
+        """Mask e-mails and phone numbers when security mode is enabled."""
+        email_re = re.compile(r"[\w.\-]+@[\w\-]+\.[A-Za-z]{2,}")
+        phone_re = re.compile(r"(\+?\d[\d\s\-]{6,}\d)")
+        text = email_re.sub("[EMAIL]", text)
+        text = phone_re.sub("[PHONE]", text)
+        return text
+
+    def _apply_do_not_translate(self, text):
+        mapping = {}
+        for idx, term in enumerate(self.glossary.get("dnt", [])):
+            placeholder = f"<<DNT_{idx}>>"
+            if term:
+                text = text.replace(term, placeholder)
+                mapping[placeholder] = term
+        return text, mapping
+
+    def _restore_placeholders(self, text, mapping):
+        for placeholder, term in mapping.items():
+            text = text.replace(placeholder, term)
+        return text
+
+    def _preprocess_text_for_send(self, text):
+        original = text
+        if self.security_mode_var.get():
+            text = self._mask_sensitive(text)
+        text, placeholders = self._apply_do_not_translate(text)
+        return text, placeholders, original
+
+    def _auto_detect_direction(self, text):
+        """Lightweight German/English detection; returns 'de-en' or 'en-de'."""
+        sample = text[:500].lower()
+        umlauts = sum(sample.count(ch) for ch in ["ä", "ö", "ü", "ß"])
+        german_markers = sum(sample.count(w) for w in [" und ", " die ", " der ", "das ", "nicht "])
+        english_markers = sum(sample.count(w) for w in [" and ", " the ", " of ", "not ", "is "])
+        score = umlauts + german_markers - english_markers
+        return "de-en" if score >= 0 else "en-de"
+
     def update_translation_prompt(self, event=None): # event=None allows calling it directly
         # This method could potentially update a label showing the prompt, 
         # but for now, it just ensures the prompt is ready when needed.
         # We also re-check button state as direction change might affect logic later.
         self.update_translate_button_state()
         pass
+
+    def _current_model_options(self):
+        opts = {
+            "temperature": float(self.temp_var.get()),
+            "top_p": float(self.top_p_var.get())
+        }
+        try:
+            max_tokens = int(self.max_tokens_var.get() or 0)
+            if max_tokens > 0:
+                opts["num_predict"] = max_tokens
+        except Exception:
+            pass
+        return opts
 
     def start_translation(self):
         if not self.active_model:
@@ -713,6 +1007,20 @@ class OllamaTranslatorApp:
         input_content = self.input_text.get("1.0", "end-1c").strip()
         if not input_content:
             messagebox.showerror("Error", "Input text cannot be empty.")
+            return
+
+        if self.auto_detect_var.get():
+            detected = self._auto_detect_direction(input_content)
+            if detected != self.direction_var.get():
+                if messagebox.askyesno("Sprache erkannt", f"Gefundene Richtung: {detected}. Anwenden?"):
+                    self.direction_var.set(detected)
+                    self.update_translation_prompt()
+
+        prepared_text, placeholders, original_text = self._preprocess_text_for_send(input_content)
+
+        if self.use_threads and not self._check_server_status():
+            self._store_offline_request(original_text, prepared_text, placeholders)
+            messagebox.showinfo("Offline", "Ollama nicht erreichbar. Text in Offline-Queue gespeichert.")
             return
 
         self.clear_error()
@@ -730,11 +1038,11 @@ class OllamaTranslatorApp:
         self.cancel_button.config(state=tk.NORMAL)
 
         # Simple AbortController simulation
-        self.translation_controller = {'abort': False, 'start_time': time.time()}
+        self.translation_controller = {'abort': False, 'start_time': time.time(), 'placeholders': placeholders, 'original': original_text}
         if self.use_threads:
-            threading.Thread(target=self._translate_thread, args=(input_content, self.translation_controller), daemon=True).start()
+            threading.Thread(target=self._translate_thread, args=(prepared_text, self.translation_controller), daemon=True).start()
         else:
-            self._translate_thread(input_content, self.translation_controller)
+            self._translate_thread(prepared_text, self.translation_controller)
 
     def _translate_thread(self, text_to_translate, controller):
         try:
@@ -752,11 +1060,12 @@ class OllamaTranslatorApp:
             for idx, chunk_text in enumerate(chunks, start=1):
                 if controller.get('abort'):
                     break
-                prompt = self.get_translation_prompt() + chunk_text
+                prompt = self._build_prompt(chunk_text)
                 payload = {
                     "model": self.active_model,
                     "prompt": prompt,
-                    "stream": True  # Use streaming API
+                    "stream": True,  # Use streaming API
+                    "options": self._current_model_options()
                 }
 
                 # Make the streaming request per chunk
@@ -767,8 +1076,11 @@ class OllamaTranslatorApp:
                 if idx > 1:
                     self._dispatch_ui(lambda: self.output_text.insert(tk.END, "\n\n"))
 
-                self._dispatch_ui(lambda i=idx, n=len(chunks): self.status_label.config(
-                    text=f"Translating ({i}/{n})...", foreground="blue"))
+                def _status_update(i=idx, n=len(chunks)):
+                    elapsed = time.time() - start_time
+                    eta = max(0, (elapsed / i) * (n - i)) if i else 0
+                    self.status_label.config(text=f"Translating ({i}/{n}) ETA {eta:.1f}s", foreground="blue")
+                self._dispatch_ui(_status_update)
 
                 chunk_response = ""
                 for line in response.iter_lines():
@@ -800,6 +1112,9 @@ class OllamaTranslatorApp:
                 self._log_event("translate_cancelled", model=self.active_model, seconds=round(time.time()-start_time,2))
             else:
                 full_response = "\n\n".join(part.strip() for part in full_response_parts if part.strip())
+                placeholders = controller.get('placeholders', {}) if isinstance(controller, dict) else {}
+                if placeholders:
+                    full_response = self._restore_placeholders(full_response, placeholders)
 
                 def _apply_full_response():
                     # Ensure the complete translation is in the output box (guards against any dropped stream chunks).
@@ -811,6 +1126,8 @@ class OllamaTranslatorApp:
                 if not full_response.strip():
                     self._dispatch_ui(self.show_error, "No translation received.")
                 print("Translation finished.")
+                original_src = controller.get('original') if isinstance(controller, dict) else text_to_translate
+                self._dispatch_ui(lambda: self._add_history_entry(original_src, full_response))
                 self._log_event(
                     "translate_ok",
                     model=self.active_model,
@@ -859,6 +1176,226 @@ class OllamaTranslatorApp:
             # The thread will check the flag and stop
             self.cancel_button.config(state=tk.DISABLED)  # Prevent multiple clicks
             self.update_translate_button_state()  # Ensure button states are updated after cancellation
+
+    # --- History Methods ---
+    def _add_history_entry(self, source_text, output_text):
+        ts = datetime.now().strftime("%H:%M:%S")
+        entry = {
+            "ts": ts,
+            "src": source_text,
+            "out": output_text,
+            "direction": self.direction_var.get(),
+            "model": self.active_model
+        }
+        self.history.insert(0, entry)
+        self.history = self.history[:self.history_limit]
+        self._refresh_history_list()
+
+    def _refresh_history_list(self):
+        if not hasattr(self, "history_list"):
+            return
+        self.history_list.delete(0, tk.END)
+        for item in self.history:
+            label = f"[{item['ts']}] {item['direction']} {item['model']}: {item['src'][:40].replace('\n',' ')}"
+            self.history_list.insert(tk.END, label)
+
+    def _history_copy(self):
+        sel = self.history_list.curselection() if hasattr(self, "history_list") else []
+        if not sel:
+            return
+        entry = self.history[sel[0]]
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(entry.get('out', ''))
+        except tk.TclError:
+            pass
+
+    def _history_retry(self):
+        sel = self.history_list.curselection() if hasattr(self, "history_list") else []
+        if not sel:
+            return
+        entry = self.history[sel[0]]
+        self.input_text.delete('1.0', tk.END)
+        self.input_text.insert('1.0', entry.get('src', ''))
+        self.direction_var.set(entry.get('direction', self.direction_var.get()))
+        self.update_translate_button_state()
+
+    # --- Batch Methods ---
+    def _refresh_batch_list(self):
+        if not hasattr(self, "batch_list"):
+            return
+        self.batch_list.delete(0, tk.END)
+        for item in self.batch_queue:
+            label = f"{item.get('label','Item')} [{item.get('status','pending')} ]"
+            self.batch_list.insert(tk.END, label)
+
+    def _batch_add_current(self):
+        text = self.input_text.get('1.0', 'end-1c').strip()
+        if not text:
+            messagebox.showwarning("Leer", "Kein Text im Eingabefeld.")
+            return
+        self.batch_queue.append({"text": text, "status": "pending", "label": "Input"})
+        self._refresh_batch_list()
+
+    def _batch_add_files(self):
+        paths = filedialog.askopenfilenames(title="Batch Dateien", filetypes=[("Text/PDF", "*.txt;*.pdf"), ("Alle", "*.*")])
+        if not paths:
+            return
+        for path in paths:
+            content = ""
+            try:
+                if path.lower().endswith('.pdf'):
+                    content = self._extract_pdf_text(path, controller=None, progress_cb=None)
+                else:
+                    with open(path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                if content:
+                    self.batch_queue.append({"text": content, "status": "pending", "label": os.path.basename(path)})
+            except Exception as e:
+                self._log_event("batch_add_error", file=path, error=str(e))
+        self._refresh_batch_list()
+
+    def _batch_remove_selected(self):
+        sel = self.batch_list.curselection() if hasattr(self, "batch_list") else []
+        if not sel:
+            return
+        idx = sel[0]
+        if 0 <= idx < len(self.batch_queue):
+            self.batch_queue.pop(idx)
+        self._refresh_batch_list()
+
+    def _batch_clear(self):
+        self.batch_queue.clear()
+        self.batch_results.clear()
+        self._refresh_batch_list()
+
+    def _start_batch(self):
+        if not self.active_model:
+            messagebox.showerror("Error", "No model selected for translation.")
+            return
+        if not self.batch_queue:
+            messagebox.showwarning("Batch leer", "Keine Eintr„ge in der Batch-Warteschlange.")
+            return
+        self.status_label.config(text="Batch l„uft...", foreground="blue")
+        if self.use_threads:
+            threading.Thread(target=self._run_batch_thread, daemon=True).start()
+        else:
+            self._run_batch_thread()
+
+    def _run_batch_thread(self):
+        total = len(self.batch_queue)
+        self.batch_results.clear()
+        for idx, item in enumerate(self.batch_queue, start=1):
+            item['status'] = 'running'
+            self._dispatch_ui(self._refresh_batch_list)
+            self._dispatch_ui(lambda i=idx, n=total: self.status_label.config(text=f"Batch {i}/{n}", foreground="blue"))
+            text = item.get('text', '')
+            prepared, placeholders, original = self._preprocess_text_for_send(text)
+            try:
+                translated = self._translate_text_blocking(prepared, placeholders, original)
+                item['status'] = 'done'
+                self.batch_results.append({"source": original, "output": translated})
+            except Exception as e:
+                item['status'] = 'error'
+                self._log_event("batch_item_error", error=str(e))
+            self._dispatch_ui(self._refresh_batch_list)
+        self._dispatch_ui(lambda: self.status_label.config(text="Batch fertig", foreground="green"))
+
+    def _translate_text_blocking(self, text, placeholders, original):
+        chunks = self._chunk_text_for_translation(text)
+        outputs = []
+        for chunk in chunks:
+            payload = {
+                "model": self.active_model,
+                "prompt": self._build_prompt(chunk),
+                "stream": False,
+                "options": self._current_model_options()
+            }
+            resp = requests.post(f"{self.get_api_base_url()}/generate", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            outputs.append(data.get('response', ''))
+        full = "\n\n".join(outputs)
+        if placeholders:
+            full = self._restore_placeholders(full, placeholders)
+        self._add_history_entry(original, full)
+        return full
+
+    def _export_batch_results(self):
+        if not self.batch_results:
+            messagebox.showwarning("Keine Ergebnisse", "Es gibt keine Batch-Ergebnisse zum Export.")
+            return
+        filepath = filedialog.asksaveasfilename(title="Batch Export", defaultextension=".txt",
+                                                filetypes=[("Text", "*.txt"), ("Alle", "*.*")])
+        if not filepath:
+            return
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                for idx, item in enumerate(self.batch_results, start=1):
+                    f.write(f"### Item {idx}\n")
+                    f.write("--- Source ---\n")
+                    f.write(item.get('source', ''))
+                    f.write("\n\n--- Translation ---\n")
+                    f.write(item.get('output', ''))
+                    f.write("\n\n")
+            messagebox.showinfo("Export", "Batch-Ergebnisse gespeichert.")
+        except Exception as e:
+            messagebox.showerror("Export-Fehler", str(e))
+
+    # --- Feedback ---
+    def _open_feedback_dialog(self):
+        rating = messagebox.askquestion("Bewerten", "War die bersetzung hilfreich?", icon='question')
+        revision = simpledialog.askstring("Revision", "Optionaler Revisions-Prompt (leer lassen zum berspringen):", parent=self.root)
+        self._log_event("user_feedback", rating=rating, revision=bool(revision))
+        if revision:
+            current_output = self.output_text.get('1.0', 'end-1c').strip()
+            if not current_output:
+                return
+            self.input_text.delete('1.0', tk.END)
+            self.input_text.insert('1.0', current_output + "\n\n" + revision)
+            self.update_translate_button_state()
+            self.start_translation()
+
+    # --- Glossary ---
+    def _load_glossary(self):
+        path = filedialog.askopenfilename(title="Glossar w„hlen", filetypes=[("CSV/JSON", "*.csv;*.json"), ("Alle", "*.*")])
+        if not path:
+            return
+        self._load_glossary_from_path(path)
+
+    def _load_glossary_from_path(self, path):
+        mapping = {}
+        dnt = set()
+        try:
+            if path.lower().endswith('.csv'):
+                with open(path, newline='', encoding='utf-8') as f:
+                    reader = csv.reader(f)
+                    for row in reader:
+                        if len(row) >= 2:
+                            mapping[row[0].strip()] = row[1].strip()
+                        elif len(row) == 1:
+                            dnt.add(row[0].strip())
+            elif path.lower().endswith('.json'):
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    if 'do_not_translate' in data:
+                        dnt.update(data.get('do_not_translate', []))
+                    for k, v in data.items():
+                        if k == 'do_not_translate':
+                            continue
+                        mapping[k] = v
+                elif isinstance(data, list):
+                    for entry in data:
+                        if isinstance(entry, dict) and 'source' in entry and 'target' in entry:
+                            mapping[entry['source']] = entry['target']
+            self.glossary = {"map": mapping, "dnt": dnt, "path": path}
+            label = os.path.basename(path)
+            if hasattr(self, 'glossary_label'):
+                self.glossary_label.config(text=f"Glossar: {label} ({len(mapping)} Begriffe)")
+            self._log_event("glossary_loaded", terms=len(mapping), dnt=len(dnt))
+        except Exception as e:
+            messagebox.showerror("Glossar-Fehler", str(e))
 
     # --- File I/O Methods --- 
     def upload_txt(self):
@@ -1023,15 +1560,77 @@ class OllamaTranslatorApp:
             print(f"pypdf fallback failed: {e}")
             return ""
 
+    def _read_offline_queue(self):
+        if os.path.exists(OFFLINE_QUEUE_PATH):
+            try:
+                with open(OFFLINE_QUEUE_PATH, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                return []
+        return []
+
+    def _write_offline_queue(self, data):
+        try:
+            with open(OFFLINE_QUEUE_PATH, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self._log_event("offline_queue_write_error", error=str(e))
+
+    def _store_offline_request(self, original_text, prepared_text, placeholders):
+        queue_data = self._read_offline_queue()
+        queue_data.append({
+            "original": original_text,
+            "prepared": prepared_text,
+            "placeholders": placeholders,
+            "direction": self.direction_var.get(),
+            "model": self.active_model,
+            "profile": self.prompt_profile_var.get(),
+            "timestamp": time.time()
+        })
+        self._write_offline_queue(queue_data)
+
+    def _process_offline_queue(self):
+        queue_data = self._read_offline_queue()
+        if not queue_data:
+            messagebox.showinfo("Offline-Queue", "Keine gespeicherten Anfragen.")
+            return
+        remaining = []
+        for item in queue_data:
+            try:
+                self.direction_var.set(item.get("direction", self.direction_var.get()))
+                if item.get("model"):
+                    self.active_model = item.get("model")
+                self.update_translate_button_state()
+                translated = self._translate_text_blocking(item.get("prepared", ""), item.get("placeholders", {}), item.get("original", ""))
+                self.output_text.config(state=tk.NORMAL)
+                self.output_text.delete('1.0', tk.END)
+                self.output_text.insert('1.0', translated)
+                self.output_text.config(state=tk.DISABLED)
+            except Exception as e:
+                remaining.append(item)
+                self._log_event("offline_queue_fail", error=str(e))
+        self._write_offline_queue(remaining)
+        if not remaining:
+            messagebox.showinfo("Offline-Queue", "Alle gespeicherten Anfragen wurden bertragen.")
+        else:
+            messagebox.showwarning("Offline-Queue", f"{len(remaining)} Eintr„ge verblieben.")
+
     def get_api_base_url(self):
         return self.api_endpoint_var.get().strip()
 
-    def save_txt(self):
+    def _get_output_text(self):
+        """Return translated text or show a warning if unavailable."""
         output_content = self.output_text.get("1.0", "end-1c").strip()
         if not output_content or output_content == "Translating...":
             messagebox.showwarning("No Output", "There is no translated text to save.")
+            return None
+        return output_content
+
+    def save_txt(self):
+        output_content = self._get_output_text()
+        if output_content is None:
             return
-            
+
         filepath = filedialog.asksaveasfilename(
             title="Save Translation As",
             defaultextension=".txt",
@@ -1046,6 +1645,108 @@ class OllamaTranslatorApp:
         except Exception as e:
             messagebox.showerror("File Save Error", f"Could not save file: {e}")
             self.show_error(f"Error saving file: {filepath}")
+
+    def save_markdown(self):
+        output_content = self._get_output_text()
+        if output_content is None:
+            return
+
+        filepath = filedialog.asksaveasfilename(
+            title="Save Translation As Markdown",
+            defaultextension=".md",
+            filetypes=[("Markdown Files", "*.md"), ("All Files", "*.*")]
+        )
+        if not filepath:
+            return
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(output_content)
+            self.clear_error()
+        except Exception as e:
+            messagebox.showerror("File Save Error", f"Could not save Markdown: {e}")
+            self.show_error(f"Error saving file: {filepath}")
+
+    def save_docx(self):
+        output_content = self._get_output_text()
+        if output_content is None:
+            return
+        if Document is None:
+            messagebox.showerror("DOCX Export", "python-docx ist nicht installiert. Bitte `pip install python-docx` ausführen.")
+            self.show_error("DOCX Export fehlgeschlagen (python-docx fehlt).")
+            return
+
+        filepath = filedialog.asksaveasfilename(
+            title="Save Translation As DOCX",
+            defaultextension=".docx",
+            filetypes=[("Word Document", "*.docx"), ("All Files", "*.*")]
+        )
+        if not filepath:
+            return
+        try:
+            doc = Document()
+            for block in output_content.split("\n\n"):
+                doc.add_paragraph(block)
+                doc.add_paragraph("")  # preserve blank line spacing
+            doc.save(filepath)
+            self.clear_error()
+        except Exception as e:
+            messagebox.showerror("File Save Error", f"Could not save DOCX: {e}")
+            self.show_error(f"Error saving file: {filepath}")
+
+    def save_pdf(self):
+        output_content = self._get_output_text()
+        if output_content is None:
+            return
+        if FPDF is None:
+            messagebox.showerror("PDF Export", "fpdf2 ist nicht installiert. Bitte `pip install fpdf2` ausführen.")
+            self.show_error("PDF Export fehlgeschlagen (fpdf2 fehlt).")
+            return
+
+        include_refs = messagebox.askyesnocancel(
+            "PDF-Export",
+            "Seitenreferenzen als Fußzeile hinzufügen?\n(Ja = Seitenzahlen anfügen, Nein = ohne)"
+        )
+        if include_refs is None:
+            return
+
+        filepath = filedialog.asksaveasfilename(
+            title="Export Translation as PDF",
+            defaultextension=".pdf",
+            filetypes=[("PDF Files", "*.pdf"), ("All Files", "*.*")]
+        )
+        if not filepath:
+            return
+
+        try:
+            class ReferencedPDF(FPDF):
+                def __init__(self, add_refs=False):
+                    super().__init__()
+                    self.add_refs = add_refs
+
+                def footer(self):
+                    if not self.add_refs:
+                        return
+                    self.set_y(-15)
+                    self.set_font("Arial", "I", 8)
+                    self.cell(0, 10, f"Seite {self.page_no()}/{{nb}}", 0, 0, "C")
+
+            pdf = ReferencedPDF(add_refs=include_refs)
+            pdf.set_auto_page_break(auto=True, margin=15)
+            pdf.alias_nb_pages()
+            pdf.add_page()
+            pdf.set_font("Arial", size=12)
+
+            safe_text = output_content.encode("latin-1", "replace").decode("latin-1")
+            for para in safe_text.split("\n\n"):
+                for line in para.splitlines():
+                    pdf.multi_cell(0, 8, line)
+                pdf.ln(4)
+
+            pdf.output(filepath)
+            self.clear_error()
+        except Exception as e:
+            messagebox.showerror("File Save Error", f"Could not save PDF: {e}")
+            self.show_error(f"Error saving PDF: {filepath}")
 
     def copy_to_clipboard(self):
         output_content = self.output_text.get("1.0", "end-1c").strip()
