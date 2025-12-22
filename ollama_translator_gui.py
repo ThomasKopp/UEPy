@@ -230,21 +230,34 @@ class OllamaTranslatorApp:
         PaddleOCR_cls = self._lazy_import_paddleocr()
         if not PaddleOCR_cls:
             return None
-        # PaddleOCR args changed across versions; try a few safe combinations.
+        def _looks_like_unknown_kwarg(exc: Exception) -> bool:
+            msg = str(exc).lower()
+            return (
+                "unknown argument" in msg
+                or "unexpected keyword" in msg
+                or "got an unexpected keyword argument" in msg
+            )
+
+        # PaddleOCR args changed across versions; try minimal args first, then opt-ins.
         candidates = [
-            {"lang": lang, "use_textline_orientation": True, "show_log": False},
-            {"lang": lang, "use_angle_cls": True, "show_log": False},
-            {"lang": lang, "use_angle_cls": True},
-            {"lang": lang, "show_log": False},
             {"lang": lang},
+            {"lang": lang, "show_log": False},
+            {"lang": lang, "use_angle_cls": True},
+            {"lang": lang, "use_angle_cls": True, "show_log": False},
+            {"lang": lang, "use_textline_orientation": True},
+            {"lang": lang, "use_textline_orientation": True, "show_log": False},
         ]
         last_exc = None
         for kwargs in candidates:
             try:
                 return PaddleOCR_cls(**kwargs)
-            except TypeError as exc:
-                last_exc = exc
-                continue
+            except Exception as exc:
+                # Some PaddleOCR versions raise TypeError, others raise generic Exceptions like:
+                # "Unknown argument: show_log". Treat these as "try next candidate".
+                if isinstance(exc, TypeError) or _looks_like_unknown_kwarg(exc):
+                    last_exc = exc
+                    continue
+                raise
         raise last_exc
 
     def _paddleocr_text_segments(self, result):
@@ -2039,6 +2052,13 @@ class OllamaTranslatorApp:
             return
 
         try:
+            # fpdf2 >= 2.5.2 deprecates `ln=` in favor of new_x/new_y enums.
+            try:
+                from fpdf import XPos, YPos  # type: ignore
+            except Exception:
+                XPos = None
+                YPos = None
+
             class ReferencedPDF(FPDF):
                 def __init__(self, add_refs=False):
                     super().__init__()
@@ -2050,7 +2070,17 @@ class OllamaTranslatorApp:
                     self.set_y(-15)
                     # Use a core font to avoid fpdf2's Arial substitution deprecation warnings.
                     self.set_font("Helvetica", "I", 8)
-                    self.cell(0, 10, f"Seite {self.page_no()}/{{nb}}", 0, 0, "C")
+                    if XPos is not None and YPos is not None:
+                        self.cell(
+                            0,
+                            10,
+                            f"Seite {self.page_no()}/{{nb}}",
+                            align="C",
+                            new_x=XPos.RIGHT,
+                            new_y=YPos.TOP,
+                        )
+                    else:
+                        self.cell(0, 10, f"Seite {self.page_no()}/{{nb}}", 0, 0, "C")
 
             pdf = ReferencedPDF(add_refs=include_refs)
             pdf.set_auto_page_break(auto=True, margin=15)
@@ -2059,11 +2089,65 @@ class OllamaTranslatorApp:
             # Use a core font to avoid fpdf2's Arial substitution deprecation warnings.
             pdf.set_font("Helvetica", size=12)
 
-            safe_text = output_content.encode("latin-1", "replace").decode("latin-1")
+            def _clean_for_pdf(text: str) -> str:
+                text = text.replace("\t", "    ")
+                # Remove control chars (keep newlines) that can break rendering/parsing.
+                text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]", " ", text)
+                # Core fonts are Latin-1 only; replace unsupported chars.
+                return text.encode("latin-1", "replace").decode("latin-1")
+
+            def _split_to_fit_line(text: str, max_width: float) -> list[str]:
+                if max_width <= 0:
+                    return [text]
+                if not text:
+                    return [""]
+                parts: list[str] = []
+                remaining = text
+                while remaining:
+                    if pdf.get_string_width(remaining) <= max_width:
+                        parts.append(remaining)
+                        break
+
+                    cut = min(len(remaining), 2000)
+                    while cut > 0 and pdf.get_string_width(remaining[:cut]) > max_width:
+                        cut -= 1
+
+                    if cut <= 0:
+                        parts.append(remaining[0])
+                        remaining = remaining[1:]
+                        continue
+
+                    chunk = remaining[:cut]
+                    space = chunk.rfind(" ")
+                    if space > 0:
+                        parts.append(chunk[:space].rstrip())
+                        remaining = remaining[space + 1 :].lstrip()
+                    else:
+                        parts.append(chunk)
+                        remaining = remaining[cut:]
+                return parts
+
+            safe_text = _clean_for_pdf(output_content)
+            line_height = 8
+            para_gap = 4
+            full_width = pdf.w - pdf.l_margin - pdf.r_margin
+
             for para in safe_text.split("\n\n"):
-                for line in para.splitlines():
-                    pdf.multi_cell(0, 8, line)
-                pdf.ln(4)
+                lines = para.splitlines() or [""]
+                for line in lines:
+                    pdf.set_x(pdf.l_margin)
+                    for chunk in _split_to_fit_line(line, full_width):
+                        if XPos is not None and YPos is not None:
+                            pdf.cell(
+                                0,
+                                line_height,
+                                chunk,
+                                new_x=XPos.LMARGIN,
+                                new_y=YPos.NEXT,
+                            )
+                        else:
+                            pdf.cell(0, line_height, chunk, 0, 1)
+                pdf.ln(para_gap)
 
             pdf.output(filepath)
             self.clear_error()
