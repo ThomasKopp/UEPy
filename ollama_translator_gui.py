@@ -5,6 +5,10 @@ import json
 import logging
 import csv
 import re
+import contextlib
+import io
+import shutil
+import warnings
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 import queue
@@ -17,38 +21,40 @@ from tkinter.ttk import Style
 import requests
 from pypdf import PdfReader
 
-# Optional OCR / document preprocessing
-try:
-    from unstructured.partition.pdf import partition_pdf
-except Exception:
-    partition_pdf = None
+# --- Windows-only: silence Paddle's ccache probe noise ---
+# Paddle's cpp_extension utilities look for a file literally named "ccache" on PATH. If not found,
+# it may call `where ccache` which prints "INFORMATION: Es konnten keine Dateien..." and emits a warning.
+# We install a no-op shim early to avoid that noisy probe.
+if os.name == "nt":
+    try:
+        shim_dir = os.path.join(os.path.expanduser("~"), ".ollama_translator_shims")
+        os.makedirs(shim_dir, exist_ok=True)
+        shim_path = os.path.join(shim_dir, "ccache")  # intentionally no extension
+        if not os.path.exists(shim_path):
+            with open(shim_path, "w", encoding="utf-8") as f:
+                f.write("")
+        current_path = os.environ.get("PATH", "")
+        if shim_dir not in current_path.split(os.pathsep):
+            os.environ["PATH"] = shim_dir + os.pathsep + current_path
+    except Exception:
+        pass
 
-try:
-    from paddleocr import PaddleOCR
-except Exception:
-    PaddleOCR = None
+# Reduce noise from optional native deps (e.g. Paddle/PaddleOCR) when they are imported.
+warnings.filterwarnings("ignore", message=r"No ccache found\..*", category=UserWarning)
 
-try:
-    from pdf2image import convert_from_path
-except Exception:
-    convert_from_path = None
-
-# Optional export helpers
-try:
-    from docx import Document
-except Exception:
-    Document = None
-
-try:
-    from fpdf import FPDF
-except Exception:
-    FPDF = None
+# Optional dependencies are imported lazily to keep startup fast and avoid noisy helper-binary probes.
+partition_pdf = None
+PaddleOCR = None
+convert_from_path = None
+Document = None
+FPDF = None
 # Default Ollama API endpoint
 DEFAULT_OLLAMA_API_BASE_URL = "http://localhost:11434/api"
 DEFAULT_CHUNK_CHAR_LIMIT = 1600  # Chunk long texts to avoid model/context breakdowns
 DEFAULT_HISTORY_LIMIT = 10
 OFFLINE_QUEUE_PATH = os.path.join(os.path.expanduser("~"), ".ollama_translator_offline_queue.json")
 GLOSSARY_MAX_ITEMS = 50
+DEFAULT_OCR_DPI = 300
 
 # --- Theme Definitions ---
 LIGHT_THEME = {
@@ -108,6 +114,242 @@ DEFAULT_SHORTCUTS = {
 }
 
 class OllamaTranslatorApp:
+    # --- Lazy imports (optional dependencies) ---
+    @contextlib.contextmanager
+    def _suppress_native_output(self):
+        """
+        Suppress process-level stdout/stderr (including child-process output) while importing
+        optional dependencies that may call helper binaries on Windows (e.g. `where.exe`)
+        or emit noisy native logs.
+        """
+        try:
+            devnull_fd = os.open(os.devnull, os.O_WRONLY)
+            saved_out = os.dup(1)
+            saved_err = os.dup(2)
+            os.dup2(devnull_fd, 1)
+            os.dup2(devnull_fd, 2)
+            os.close(devnull_fd)
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    yield
+            finally:
+                os.dup2(saved_out, 1)
+                os.dup2(saved_err, 2)
+                os.close(saved_out)
+                os.close(saved_err)
+        except Exception:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                yield
+
+    def _lazy_import_unstructured(self):
+        global partition_pdf
+        if partition_pdf is not None:
+            return partition_pdf
+        try:
+            with self._suppress_native_output():
+                from unstructured.partition.pdf import partition_pdf as _partition_pdf
+            partition_pdf = _partition_pdf
+        except Exception:
+            partition_pdf = None
+        return partition_pdf
+
+    def _lazy_import_pdf2image(self):
+        global convert_from_path
+        if convert_from_path is not None:
+            return convert_from_path
+        try:
+            with self._suppress_native_output():
+                from pdf2image import convert_from_path as _convert_from_path
+            convert_from_path = _convert_from_path
+        except Exception:
+            convert_from_path = None
+        return convert_from_path
+
+    def _lazy_import_paddleocr(self):
+        global PaddleOCR
+        if PaddleOCR is not None:
+            return PaddleOCR
+
+        # Best-effort: reduce noisy native logging from OCR dependencies.
+        os.environ.setdefault("GLOG_minloglevel", "2")
+        os.environ.setdefault("FLAGS_minloglevel", "2")
+        os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+        os.environ.setdefault("KMP_WARNINGS", "0")
+        os.environ.setdefault("PADDLE_LOG_LEVEL", "3")
+
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=r"No ccache found\..*", category=UserWarning)
+                with self._suppress_native_output():
+                    from paddleocr import PaddleOCR as _PaddleOCR
+            PaddleOCR = _PaddleOCR
+        except Exception:
+            PaddleOCR = None
+        return PaddleOCR
+
+    def _lazy_import_docx(self):
+        global Document
+        if Document is not None:
+            return Document
+        try:
+            with self._suppress_native_output():
+                from docx import Document as _Document
+            Document = _Document
+        except Exception:
+            Document = None
+        return Document
+
+    def _lazy_import_fpdf(self):
+        global FPDF
+        if FPDF is not None:
+            return FPDF
+        try:
+            with self._suppress_native_output():
+                from fpdf import FPDF as _FPDF
+            FPDF = _FPDF
+        except Exception:
+            FPDF = None
+        return FPDF
+
+    def _get_poppler_path(self):
+        """
+        Optional: resolve a Poppler bin directory for pdf2image on Windows.
+        Users can set POPPLER_PATH to either the Poppler root or its bin directory.
+        """
+        raw = os.environ.get("POPPLER_PATH", "").strip()
+        if not raw:
+            return None
+        if os.path.isdir(raw) and os.path.isfile(os.path.join(raw, "pdfinfo.exe")):
+            return raw
+        bin_dir = os.path.join(raw, "bin")
+        if os.path.isdir(bin_dir) and os.path.isfile(os.path.join(bin_dir, "pdfinfo.exe")):
+            return bin_dir
+        return None
+
+    def _create_paddleocr(self, lang):
+        PaddleOCR_cls = self._lazy_import_paddleocr()
+        if not PaddleOCR_cls:
+            return None
+        # PaddleOCR args changed across versions; try a few safe combinations.
+        candidates = [
+            {"lang": lang, "use_textline_orientation": True, "show_log": False},
+            {"lang": lang, "use_angle_cls": True, "show_log": False},
+            {"lang": lang, "use_angle_cls": True},
+            {"lang": lang, "show_log": False},
+            {"lang": lang},
+        ]
+        last_exc = None
+        for kwargs in candidates:
+            try:
+                return PaddleOCR_cls(**kwargs)
+            except TypeError as exc:
+                last_exc = exc
+                continue
+        raise last_exc
+
+    def _paddleocr_text_segments(self, result):
+        """Return text segments from PaddleOCR outputs across versions."""
+        if result is None:
+            return []
+        segments = []
+
+        def visit(obj):
+            if isinstance(obj, (list, tuple)):
+                # Common line format: [box, (text, score)]
+                if (
+                    len(obj) == 2
+                    and isinstance(obj[1], (list, tuple))
+                    and len(obj[1]) >= 1
+                    and isinstance(obj[1][0], str)
+                ):
+                    segments.append(obj[1][0])
+                    return
+                for item in obj:
+                    visit(item)
+
+        visit(result)
+        return segments
+
+    def _get_ocr_dpi(self):
+        try:
+            dpi = int(str(self.ocr_dpi_var.get()).strip())
+            if 72 <= dpi <= 600:
+                return dpi
+        except Exception:
+            pass
+        return DEFAULT_OCR_DPI
+
+    def _looks_like_list_item(self, line):
+        s = (line or "").lstrip()
+        return bool(re.match(r"^([-*•]\s+|\d+[.)]\s+|[A-Za-z][.)]\s+)", s))
+
+    def _preprocess_ocr_image(self, img):
+        if not getattr(self, "ocr_preprocess_var", None) or not self.ocr_preprocess_var.get():
+            return img
+        try:
+            from PIL import ImageOps, ImageEnhance, ImageFilter
+        except Exception:
+            return img
+        try:
+            gray = ImageOps.grayscale(img)
+            gray = ImageOps.autocontrast(gray)
+            gray = ImageEnhance.Contrast(gray).enhance(1.6)
+            gray = gray.filter(ImageFilter.SHARPEN)
+            return gray
+        except Exception:
+            return img
+
+    def _postprocess_ocr_text(self, text):
+        if not getattr(self, "ocr_cleanup_var", None) or not self.ocr_cleanup_var.get():
+            return (text or "").strip()
+
+        t = (text or "").replace("\r\n", "\n").replace("\r", "\n").replace("\u00ad", "")
+        t = re.sub(r"(?<=\w)-\n(?=\w)", "", t)
+
+        lines = t.split("\n")
+        out = []
+        for raw in lines:
+            cur = raw.rstrip()
+            if not out:
+                out.append(cur)
+                continue
+            prev = out[-1]
+            if not prev.strip() or not cur.strip():
+                out.append(cur)
+                continue
+            if self._looks_like_list_item(cur):
+                out.append(cur)
+                continue
+            if self._looks_like_list_item(prev) or prev.rstrip().endswith(":"):
+                out.append(cur)
+                continue
+            if re.search(r"[.!?][\"')\]]?$", prev.strip()):
+                out.append(cur)
+                continue
+            out[-1] = prev.rstrip() + " " + cur.lstrip()
+
+        t = "\n".join(out)
+        t = re.sub(r"[ \t]+", " ", t)
+        t = re.sub(r"\n{3,}", "\n\n", t)
+        return t.strip()
+
+    def _pdf_to_images(self, filepath, convert_fn, poppler_path):
+        dpi = self._get_ocr_dpi()
+        base_kwargs = {"dpi": dpi, "fmt": "png", "grayscale": True}
+        if poppler_path:
+            base_kwargs["poppler_path"] = poppler_path
+        try:
+            return convert_fn(filepath, **base_kwargs)
+        except TypeError:
+            # Older pdf2image versions may not accept fmt/grayscale.
+            kwargs = {"dpi": dpi}
+            if poppler_path:
+                kwargs["poppler_path"] = poppler_path
+            try:
+                return convert_fn(filepath, **kwargs)
+            except Exception:
+                return convert_fn(filepath, poppler_path=poppler_path) if poppler_path else convert_fn(filepath)
+ 
     # --- Theme Management ---
     def apply_theme(self):
         """Apply the current theme to the entire application."""
@@ -258,6 +500,12 @@ class OllamaTranslatorApp:
                 self.api_endpoint_var.set(config.get("api_endpoint", DEFAULT_OLLAMA_API_BASE_URL))
                 self.direction_var.set(config.get("direction", "de-en"))
                 self.prompt_profile_var.set(config.get("prompt_profile", "standard"))
+                if hasattr(self, "ocr_dpi_var"):
+                    self.ocr_dpi_var.set(str(config.get("ocr_dpi", DEFAULT_OCR_DPI)))
+                if hasattr(self, "ocr_cleanup_var"):
+                    self.ocr_cleanup_var.set(bool(config.get("ocr_cleanup", True)))
+                if hasattr(self, "ocr_preprocess_var"):
+                    self.ocr_preprocess_var.set(bool(config.get("ocr_preprocess", True)))
                 self.shortcuts.update(config.get("shortcuts", {}))
                 self.auto_theme_var.set(config.get("auto_theme", False))
                 self.security_mode_var.set(config.get("security_mode", False))
@@ -285,6 +533,9 @@ class OllamaTranslatorApp:
             "api_endpoint": self.api_endpoint_var.get(),
             "direction": self.direction_var.get(),
             "prompt_profile": self.prompt_profile_var.get(),
+            "ocr_dpi": self._get_ocr_dpi() if hasattr(self, "ocr_dpi_var") else DEFAULT_OCR_DPI,
+            "ocr_cleanup": bool(self.ocr_cleanup_var.get()) if hasattr(self, "ocr_cleanup_var") else True,
+            "ocr_preprocess": bool(self.ocr_preprocess_var.get()) if hasattr(self, "ocr_preprocess_var") else True,
             "last_model": self.active_model,
             "shortcuts": self.shortcuts,
             "auto_theme": self.auto_theme_var.get(),
@@ -309,6 +560,9 @@ class OllamaTranslatorApp:
         self.api_endpoint_var = tk.StringVar(value=DEFAULT_OLLAMA_API_BASE_URL)
         self.direction_var = tk.StringVar(value="de-en")
         self.prompt_profile_var = tk.StringVar(value="standard")
+        self.ocr_dpi_var = tk.StringVar(value=str(DEFAULT_OCR_DPI))
+        self.ocr_cleanup_var = tk.BooleanVar(value=True)
+        self.ocr_preprocess_var = tk.BooleanVar(value=True)
         # Disable background threads in unit test context to avoid Tk thread errors
         self.use_threads = 'unittest' not in sys.modules
 
@@ -565,7 +819,7 @@ class OllamaTranslatorApp:
 
         batch_buttons = ttk.Frame(input_frame)
         batch_buttons.grid(row=4, column=0, pady=5, sticky="w")
-        ttk.Button(batch_buttons, text="Batch: Input hinzufgen", command=self._batch_add_current).pack(side=tk.LEFT, padx=2)
+        ttk.Button(batch_buttons, text="Batch: Input hinzufügen", command=self._batch_add_current).pack(side=tk.LEFT, padx=2)
         ttk.Button(batch_buttons, text="Batch: Dateien", command=self._batch_add_files).pack(side=tk.LEFT, padx=2)
         ttk.Button(batch_buttons, text="Batch starten", command=self._start_batch).pack(side=tk.LEFT, padx=2)
         ttk.Button(batch_buttons, text="Batch export", command=self._export_batch_results).pack(side=tk.LEFT, padx=2)
@@ -580,6 +834,12 @@ class OllamaTranslatorApp:
         self.ocr_quality_var = tk.StringVar(value="praezise")
         ttk.Radiobutton(ocr_opts, text="präzise (OCR)", variable=self.ocr_quality_var, value="praezise").pack(side=tk.LEFT)
         ttk.Radiobutton(ocr_opts, text="schnell (Text-Extract)", variable=self.ocr_quality_var, value="schnell").pack(side=tk.LEFT, padx=(5,0))
+        ttk.Checkbutton(ocr_opts, text="Bereinigen", variable=self.ocr_cleanup_var, command=self._save_config).pack(side=tk.LEFT, padx=(10,0))
+        ttk.Checkbutton(ocr_opts, text="Bild-Preproc", variable=self.ocr_preprocess_var, command=self._save_config).pack(side=tk.LEFT, padx=(5,0))
+        ttk.Label(ocr_opts, text="DPI:").pack(side=tk.LEFT, padx=(10,0))
+        dpi_combo = ttk.Combobox(ocr_opts, textvariable=self.ocr_dpi_var, values=["200", "300", "400"], width=5, state="readonly")
+        dpi_combo.pack(side=tk.LEFT, padx=(3,0))
+        dpi_combo.bind("<<ComboboxSelected>>", lambda e: self._save_config())
 
         # Output Section
         output_frame = ttk.Frame(self.translation_frame)
@@ -857,7 +1117,7 @@ class OllamaTranslatorApp:
             "max_tokens": int(self.max_tokens_var.get() or 0)
         }
         self._log_event("model_settings_saved", model=self.active_model)
-        messagebox.showinfo("Gespeichert", f"Settings fr {self.active_model} gespeichert.")
+        messagebox.showinfo("Gespeichert", f"Settings für {self.active_model} gespeichert.")
 
     # --- Translation Methods --- 
     def get_translation_prompt(self):
@@ -872,9 +1132,8 @@ class OllamaTranslatorApp:
         direction_notes = (
             "Use clear, idiomatic US/UK business English. Preserve any honorifics and tone markers."
             if target_lang == "English"
-            else "Schreibe natrlich klingendes, idiomatisches Deutsch. Verwende standardm„áig die H”flichkeitsform ,Sie\", es sei denn, der Eingangstext ist eindeutig informell und durchg„ngig mit ,du\" gehalten."
+            else "Schreibe natürlich klingendes, idiomatisches Deutsch. Verwende standardmäßig die Höflichkeitsform „Sie“, es sei denn, der Eingangstext ist eindeutig informell und durchgängig mit „du“ gehalten."
         )
-
         profile_key = self.prompt_profile_var.get()
         profile_notes = PROFILE_STYLES.get(direction, {}).get(profile_key, PROFILE_STYLES.get(direction, {}).get("standard", ""))
         profile_label = profile_key if profile_key != "standard" else "standard"
@@ -898,8 +1157,8 @@ class OllamaTranslatorApp:
             pairs = list(self.glossary["map"].items())[:GLOSSARY_MAX_ITEMS]
             glossary_lines = [f"- {src} -> {tgt}" for src, tgt in pairs]
             glossary_text += "Use the following glossary exactly (no paraphrasing):\n" + "\n".join(glossary_lines) + "\n"
-        if self.glossary["dnt"]:
-            glossary_text += "Keep placeholders like <<DNT_#>> unchanged and return them verbatim.\n"
+        if self.glossary["dnt"] or ("<<" in chunk_text and ">>" in chunk_text):
+            glossary_text += "Keep placeholders like <<DNT_#>> or <<PH_#>> unchanged and return them verbatim.\n"
         return base + glossary_text + chunk_text
     def _chunk_text_for_translation(self, text, max_chars=DEFAULT_CHUNK_CHAR_LIMIT):
         """
@@ -958,6 +1217,32 @@ class OllamaTranslatorApp:
                 mapping[placeholder] = term
         return text, mapping
 
+    def _apply_auto_placeholders(self, text, mapping):
+        def next_ph():
+            i = 0
+            while True:
+                ph = f"<<PH_{i}>>"
+                if ph not in mapping and ph not in text:
+                    return ph
+                i += 1
+
+        def protect(pattern, flags=0):
+            nonlocal text
+            rx = re.compile(pattern, flags)
+
+            def repl(m):
+                ph = next_ph()
+                mapping[ph] = m.group(0)
+                return ph
+
+            text = rx.sub(repl, text)
+
+        protect(r"```[\s\S]*?```", flags=re.MULTILINE)
+        protect(r"`[^`\n]+`")
+        protect(r"\bhttps?://[^\s)\]>}]+|\bwww\.[^\s)\]>}]+")
+        protect(r"[\w.\-]+@[\w\-]+\.[A-Za-z]{2,}")
+        return text, mapping
+
     def _restore_placeholders(self, text, mapping):
         for placeholder, term in mapping.items():
             text = text.replace(placeholder, term)
@@ -968,6 +1253,7 @@ class OllamaTranslatorApp:
         if self.security_mode_var.get():
             text = self._mask_sensitive(text)
         text, placeholders = self._apply_do_not_translate(text)
+        text, placeholders = self._apply_auto_placeholders(text, placeholders)
         return text, placeholders, original
 
     def _auto_detect_direction(self, text):
@@ -1344,8 +1630,8 @@ class OllamaTranslatorApp:
 
     # --- Feedback ---
     def _open_feedback_dialog(self):
-        rating = messagebox.askquestion("Bewerten", "War die bersetzung hilfreich?", icon='question')
-        revision = simpledialog.askstring("Revision", "Optionaler Revisions-Prompt (leer lassen zum berspringen):", parent=self.root)
+        rating = messagebox.askquestion("Bewerten", "War die Übersetzung hilfreich?", icon='question')
+        revision = simpledialog.askstring("Revision", "Optionaler Revisions-Prompt (leer lassen zum Überspringen):", parent=self.root)
         self._log_event("user_feedback", rating=rating, revision=bool(revision))
         if revision:
             current_output = self.output_text.get('1.0', 'end-1c').strip()
@@ -1500,44 +1786,79 @@ class OllamaTranslatorApp:
         Returns combined text or empty string.
         """
         abort = lambda: controller is not None and controller.get('abort')
+        direction = self.direction_var.get()
+        ocr_lang_hint = "deu" if direction == "de-en" else "eng"
 
         # 1) unstructured hi-res OCR if available
-        if partition_pdf and (self.ocr_quality_var.get() == "praezise"):
+        partition_pdf_fn = self._lazy_import_unstructured()
+        if partition_pdf_fn and (self.ocr_quality_var.get() == "praezise"):
             try:
                 if abort():
                     raise KeyboardInterrupt("OCR cancelled")
-                elements = partition_pdf(
-                    filename=filepath,
-                    strategy="ocr_only",
-                    ocr_languages="deu+eng",
-                )
-                text = "\n\n".join([el.text for el in elements if getattr(el, "text", "")])
-                if text.strip():
-                    return text.strip()
+                last_exc = None
+                for langs in [ocr_lang_hint, "deu+eng"]:
+                    for strat in ["hi_res", "ocr_only"]:
+                        if abort():
+                            raise KeyboardInterrupt("OCR cancelled")
+                        try:
+                            elements = partition_pdf_fn(
+                                filename=filepath,
+                                strategy=strat,
+                                ocr_languages=langs,
+                            )
+                        except Exception as exc:
+                            last_exc = exc
+                            continue
+                        text = "\n\n".join([el.text for el in elements if getattr(el, "text", "")])
+                        if text.strip():
+                            return self._postprocess_ocr_text(text)
+                if last_exc:
+                    raise last_exc
             except Exception as e:
                 print(f"unstructured OCR failed: {e}")
 
         # 2) PaddleOCR on page images if possible
-        if PaddleOCR and convert_from_path and (self.ocr_quality_var.get() == "praezise"):
+        convert_fn = self._lazy_import_pdf2image()
+        PaddleOCR_cls = self._lazy_import_paddleocr()
+        if PaddleOCR_cls and convert_fn and (self.ocr_quality_var.get() == "praezise"):
             try:
+                # Avoid noisy Windows `where.exe` output from pdf2image/Poppler probing by checking up-front.
+                poppler_path = self._get_poppler_path()
+                if os.name == "nt" and (poppler_path is None) and (shutil.which("pdfinfo") is None) and (shutil.which("pdfinfo.exe") is None):
+                    raise FileNotFoundError("Poppler (pdfinfo) not found. Install Poppler or set POPPLER_PATH.")
+
                 lang = "german" if self.direction_var.get() == "de-en" else "en"
-                # use_angle_cls deprecated; use_textline_orientation replaces it; hide logs by env var
-                ocr = PaddleOCR(lang=lang, use_textline_orientation=True)
-                images = convert_from_path(filepath)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message=r"No ccache found\\..*", category=UserWarning)
+                    warnings.filterwarnings("ignore", message=r"Please use `predict` instead\\.", category=DeprecationWarning)
+                    ocr = self._create_paddleocr(lang=lang)
+
+                if not ocr:
+                    raise ModuleNotFoundError("PaddleOCR")
+
+                images = self._pdf_to_images(filepath, convert_fn, poppler_path)
                 total = len(images)
                 ocr_chunks = []
                 for idx, img in enumerate(images, start=1):
                     if abort():
                         raise KeyboardInterrupt("OCR cancelled")
-                    result = ocr.ocr(img, cls=True)
-                    for line in result:
-                        if line and len(line) > 0 and len(line[0]) > 1:
-                            text_seg = line[1][0]
-                            ocr_chunks.append(text_seg)
+                    img = self._preprocess_ocr_image(img)
+                    # PaddleOCR API differs across versions: prefer predict() when available.
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("ignore", message=r"Please use `predict` instead\\.", category=DeprecationWarning)
+                        if hasattr(ocr, "predict"):
+                            result = ocr.predict(img)
+                        else:
+                            result = ocr.ocr(img)
+                    ocr_chunks.extend(self._paddleocr_text_segments(result))
                     if progress_cb:
                         progress_cb(idx, total, "OCR (Paddle)")
                 if ocr_chunks:
-                    return "\n".join(ocr_chunks)
+                    return self._postprocess_ocr_text("\n".join(ocr_chunks))
+            except FileNotFoundError as e:
+                # Most common on Windows: Poppler is missing for pdf2image.
+                self._log_event("poppler_missing", error=str(e))
+                self._dispatch_ui(self.show_error, f"Poppler fehlt: {e}")
             except ModuleNotFoundError as e:
                 # PaddleOCR installed but core paddle package missing; fall back silently.
                 print(f"PaddleOCR unavailable ({e}). Falling back to pypdf text extraction.")
@@ -1555,7 +1876,7 @@ class OllamaTranslatorApp:
                 pages_text.append(page.extract_text() or "")
                 if progress_cb:
                     progress_cb(idx, total_pages, "Text-Extract")
-            return "\n\n".join(pages_text).strip()
+            return self._postprocess_ocr_text("\n\n".join(pages_text))
         except Exception as e:
             print(f"pypdf fallback failed: {e}")
             return ""
@@ -1611,7 +1932,7 @@ class OllamaTranslatorApp:
                 self._log_event("offline_queue_fail", error=str(e))
         self._write_offline_queue(remaining)
         if not remaining:
-            messagebox.showinfo("Offline-Queue", "Alle gespeicherten Anfragen wurden bertragen.")
+            messagebox.showinfo("Offline-Queue", "Alle gespeicherten Anfragen wurden Übertragen.")
         else:
             messagebox.showwarning("Offline-Queue", f"{len(remaining)} Eintr„ge verblieben.")
 
@@ -1670,7 +1991,7 @@ class OllamaTranslatorApp:
         output_content = self._get_output_text()
         if output_content is None:
             return
-        if Document is None:
+        if self._lazy_import_docx() is None:
             messagebox.showerror("DOCX Export", "python-docx ist nicht installiert. Bitte `pip install python-docx` ausführen.")
             self.show_error("DOCX Export fehlgeschlagen (python-docx fehlt).")
             return
@@ -1697,7 +2018,7 @@ class OllamaTranslatorApp:
         output_content = self._get_output_text()
         if output_content is None:
             return
-        if FPDF is None:
+        if self._lazy_import_fpdf() is None:
             messagebox.showerror("PDF Export", "fpdf2 ist nicht installiert. Bitte `pip install fpdf2` ausführen.")
             self.show_error("PDF Export fehlgeschlagen (fpdf2 fehlt).")
             return
@@ -1727,14 +2048,16 @@ class OllamaTranslatorApp:
                     if not self.add_refs:
                         return
                     self.set_y(-15)
-                    self.set_font("Arial", "I", 8)
+                    # Use a core font to avoid fpdf2's Arial substitution deprecation warnings.
+                    self.set_font("Helvetica", "I", 8)
                     self.cell(0, 10, f"Seite {self.page_no()}/{{nb}}", 0, 0, "C")
 
             pdf = ReferencedPDF(add_refs=include_refs)
             pdf.set_auto_page_break(auto=True, margin=15)
             pdf.alias_nb_pages()
             pdf.add_page()
-            pdf.set_font("Arial", size=12)
+            # Use a core font to avoid fpdf2's Arial substitution deprecation warnings.
+            pdf.set_font("Helvetica", size=12)
 
             safe_text = output_content.encode("latin-1", "replace").decode("latin-1")
             for para in safe_text.split("\n\n"):
